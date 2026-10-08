@@ -1,0 +1,48 @@
+services:
+  agent-sandbox:
+    build:
+      context: .
+    # Docker's default seccomp profile blocks the nested namespace syscalls
+    # Bubblewrap needs. The manager is trusted; agent commands still run inside
+    # the negotiated Bubblewrap boundary. Do not replace this with privileged.
+    #
+    # Docker's default runtime policy additionally masks the /proc paths
+    # Bubblewrap needs in order to mount a private procfs, so `auto` settles for
+    # `basic` here. All languages in the current polyglot image support basic
+    # through image-owned launchers. Add `systempaths=unconfined` when choosing
+    # higher process isolation Levels, not merely to enable Java or Rust.
+    # See docs/ISOLATION.md.
+    security_opt:
+      - seccomp=unconfined
+    # `.env` is the file the quick start tells you to copy, so its settings have
+    # to reach the container. Without this, Compose uses `.env` only to
+    # interpolate `${...}` below, and every other line in it is silently
+    # ignored — you edit the configuration the documentation points you at and
+    # nothing changes. `environment:` below still wins over `env_file:`, so the
+    # wiring this file has to own (the token, the volume-backed paths) is not
+    # overridable by the sample.
+    #
+    # `required: false` keeps `docker compose up` working for a deployment that
+    # configures the service entirely through `environment:` in an override.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SANDBOX_INTERNAL_TOKEN: ${SANDBOX_INTERNAL_TOKEN:?set SANDBOX_INTERNAL_TOKEN}
+      SANDBOX_DATABASE_URL: ${SANDBOX_DATABASE_URL:-sqlite+aiosqlite:////var/lib/agent-sandbox/control.db}
+      SANDBOX_DATABASE_AUTO_DDL: ${SANDBOX_DATABASE_AUTO_DDL:-true}
+      SANDBOX_REGISTRY_BACKEND: ${SANDBOX_REGISTRY_BACKEND:-memory}
+      SANDBOX_ISOLATION_LEVEL: ${SANDBOX_ISOLATION_LEVEL:-auto}
+      SANDBOX_NETWORK_MODE: ${SANDBOX_NETWORK_MODE:-host}
+      SANDBOX_ADVERTISE_HOST: agent-sandbox
+      # Pinned to the named volume. `.env.example` ships a relative default for
+      # a bare `uv run`, which inside this container would put sandboxes on the
+      # writable layer and lose them when the container is recreated.
+      SANDBOX_LOCAL_ROOT: /var/lib/agent-sandbox/sandboxes
+    ports:
+      - "${SANDBOX_BIND_ADDRESS:-127.0.0.1}:${SANDBOX_HTTP_PORT:-8080}:8080"
+    volumes:
+      - sandbox-data:/var/lib/agent-sandbox
+
+volumes:
+  sandbox-data:

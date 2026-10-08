@@ -1,0 +1,63 @@
+name: Polyglot image
+
+# Go, Rust and the JDK live only in the polyglot variant, and nothing else builds
+# it: the main CI verifies `python` and `node` on every change and would stay
+# green while three of the five documented toolchains stopped working. This
+# workflow exists so that image has an owner.
+#
+# It is a separate file because the image takes minutes to build and pulls a
+# Rust toolchain and a JDK. The `paths` filter keeps that cost off pull requests
+# that cannot affect it, while every merge to main rebuilds and re-verifies it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "Dockerfile.polyglot"
+      - "Dockerfile.base"
+      - "Dockerfile"
+      - "runtime/src/agent_sandbox_runtime/toolchains.py"
+      - "runtime/src/agent_sandbox_runtime/**"
+      - "src/agent_sandbox/**"
+      - "scripts/integration-test.sh"
+      - "scripts/verify-deployment.py"
+      - "scripts/install-polyglot-launchers.py"
+      - "scripts/verify-polyglot-runtime.py"
+      - ".github/workflows/polyglot.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  polyglot:
+    name: Go, Rust and the JDK inside a sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Install project
+        run: uv sync --frozen
+      - name: Free the disk the toolchain images need
+        # Three images of roughly two gigabytes each, plus the build cache that
+        # produced them, against a runner whose root filesystem also carries an
+        # Android SDK and a Haskell toolchain this repository never uses. The
+        # build fails with "no space left on device" partway through the JDK
+        # otherwise, which reads as a broken Dockerfile.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL \
+            /usr/share/dotnet /opt/ghc
+          df -h /
+      - name: Build the polyglot image and verify it as a deployment
+        # The same three builds docs/TOOLCHAINS.md gives a reader, then the
+        # procfs-free basic compiler/build tests and the deployment verifier
+        # with all five toolchains enabled and `--strict`.
+        run: ./scripts/integration-test.sh polyglot
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs agent-sandbox-polyglot --tail 200 || true

@@ -1,0 +1,14 @@
+Create a publication-ready technical architecture diagram for the open-source project "Sandloom". Landscape 16:9, high resolution, crisp flat vector-like infographic on a warm off-white background, rust-orange accent, charcoal text, muted teal for storage. Consistent fine lines, rounded rectangular panels, generous spacing. No photography, no 3D, no gradients, no logos from other companies. All labels below must be accurate, readable, clean English; no invented metrics.
+
+Title top left: "Sandloom". Subtitle: "One container. Many sandboxes."
+
+Top small panel "Clients" containing "AI Agents · REST / MCP" and "Admin Console". A clear arrow goes down into a large outlined central panel labelled "Trusted Linux Worker Container".
+Inside this one container: a top band labelled "Control Plane" with three concise blocks "Auth & Routing", "Lifecycle & Fencing", "Plugin Interfaces". Below, three equal distinct sandbox boxes in one row: "Sandbox A · UID 20001", "Sandbox B · UID 20002", "Sandbox C · UID 20003". Inside EACH: "Bubblewrap boundary", "/workspace · /home", "Private caches". Shared toolchains shown as one slim read-only band underneath: "Shared read-only toolchains: Python · Node · Go · Java · Rust". The worker uses shared toolchains, not one container per sandbox. Lines from control plane to all three sandboxes.
+
+A compact separate side panel labelled "Isolation Negotiation" connects to the worker. Text: "Real environment probes"; "basic → standard → strict"; "Required: fail if unavailable"; "Optional: report and skip". Show outer prerequisites with a small label "Kernel + outer container policy" connected to that panel. Do NOT imply changing permissions automatically.
+
+Bottom outside the container: four aligned adapter/storage boxes connected visibly to the control plane (not inside individual sandboxes). "Metadata" / "SQLite · PostgreSQL · MySQL"; "Worker Registry" / "Memory · Redis"; "Workspaces" / "Local or shared POSIX"; "Artifacts" / "S3-compatible" / "Templates · Checkpoints". Show a small dashed side box "Private enterprise adapters" connecting ONLY to "Plugin Interfaces", visibly outside the public implementation boundary. No enterprise names.
+
+Footer: "Isolation levels describe boundaries, not VM isolation." and "cgroup namespace ≠ per-sandbox resource quotas".
+
+Correct hierarchy is vital: one outer trusted worker container holding multiple isolated UID-separated processes/workspaces; metadata, Redis and S3 are pluggable and external/optional; POSIX is live workspace storage and S3 is artifacts, not the live filesystem. Keep arrows uncluttered and never draw a nested Docker container per sandbox. Make the image look like a polished infrastructure documentation diagram rather than a marketing illustration.

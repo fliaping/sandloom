@@ -1,0 +1,81 @@
+# Local middleware stack for integration tests.
+#
+# Every adapter the project claims to support gets a real backend here, so
+# dialect behavior and lock semantics are verified against the actual server
+# instead of a test double.
+#
+#   docker compose -f compose.integration.yaml up -d --wait
+#   ./scripts/integration-test.sh
+#   docker compose -f compose.integration.yaml down -v
+
+name: agent-sandbox-integration
+
+services:
+  mysql:
+    image: mysql:8.4
+    command:
+      # Integration tests assert row-lock behavior, so the isolation level must
+      # be explicit rather than inherited from the image default.
+      - --transaction-isolation=READ-COMMITTED
+    environment:
+      MYSQL_ROOT_PASSWORD: integration
+      MYSQL_DATABASE: agent_sandbox
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pintegration"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    tmpfs:
+      - /var/lib/mysql
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: integration
+      POSTGRES_DB: agent_sandbox
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "agent_sandbox"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # S3-compatible object storage. LocalStack is used instead of MinIO because
+  # the MinIO Docker Hub images now require authentication to pull. The version
+  # is pinned to a community release; the `stable` and `latest` tags now resolve
+  # to the Pro image, which quits at startup without a license token.
+  s3:
+    image: localstack/localstack:4.5
+    environment:
+      SERVICES: s3
+      DEBUG: "0"
+      # LocalStack accepts any credentials; the tests send these explicitly so
+      # the standard boto3 chain is actually exercised.
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "19000:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4566/_localstack/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    tmpfs:
+      - /var/lib/localstack

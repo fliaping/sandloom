@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sandloom"
+version = "0.2.0"
+description = "Sandloom: one container, many agent sandboxes"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    # Pinned to the matching release, not left open. The runtime is a second
+    # distribution built from this same repository (runtime/). `[tool.uv.sources]`
+    # below resolves it from the local path while developing, so an open
+    # requirement here looks fine forever — but a built wheel carries only the
+    # name. Sandloom's distribution names are separate from the compatibility
+    # import packages; publish the tested application/runtime pair together.
+    "sandloom-runtime==0.2.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "httpx>=0.28",
+    # No httpx2 here: `mcp` 2.x depends on the next-generation client and
+    # nothing in this project imports it, so declaring it directly would add a
+    # requirement to every install for no reason and could conflict with a
+    # future `mcp` that pins its own.
+    "python-multipart>=0.0.20",
+    "mcp>=2,<3",
+]
+
+[project.optional-dependencies]
+mysql = ["aiomysql>=0.2"]
+postgres = ["asyncpg>=0.30"]
+redis = ["redis>=4.6"]
+s3 = ["boto3>=1.34"]
+
+[dependency-groups]
+dev = [
+    "boto3>=1.34",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.9",
+    "mypy>=1.14",
+]
+
+[project.scripts]
+agent-sandbox = "agent_sandbox.main:main"
+sandloom = "agent_sandbox.main:main"
+sandloom-doctor = "agent_sandbox.doctor:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_sandbox"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.uv.sources]
+sandloom-runtime = { path = "runtime", editable = true }

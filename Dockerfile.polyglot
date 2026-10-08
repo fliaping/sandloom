@@ -1,0 +1,121 @@
+# Polyglot sandbox base image.
+#
+# The default base image ships Python and Node because that is what most agent
+# workloads use and because every gigabyte is paid for on each worker. A
+# deployment whose agents write Go, Rust, or JVM code builds this variant
+# instead and sets SANDBOX_TOOLCHAINS accordingly.
+#
+#   docker build -f Dockerfile.base -t agent-sandbox-base:latest .
+#   docker build -f Dockerfile.polyglot -t agent-sandbox-base:polyglot .
+#   docker build --build-arg BASE_IMAGE=agent-sandbox-base:polyglot -t agent-sandbox .
+#
+# Toolchains are installed under /usr/local so the sandbox sees them through
+# the existing read-only system mounts. Per-sandbox state — module caches,
+# installed binaries — stays in /cache and /envs, which the runtime supplies.
+#
+# Image-owned launchers supply library paths and Rust's sysroot explicitly.
+# All shipped languages therefore work at `basic` without mounting procfs.
+# The launchers adapt the tools, not the isolation policy. See docs/TOOLCHAINS.md.
+
+ARG BASE_IMAGE=agent-sandbox-base:latest
+
+FROM debian:bookworm-slim AS go-toolchain
+ARG GO_VERSION=1.25.1
+ARG TARGETARCH
+# Where to fetch the archive. go.dev redirects to dl.google.com, which many
+# corporate and national networks block; point this at a mirror to build
+# there, for example https://mirrors.aliyun.com/golang.
+ARG GO_DIST_BASE=https://go.dev/dl
+# The digest to check the archive against. The digests of the version this file
+# defaults to are pinned below, so building behind a mirror is
+# `--build-arg GO_DIST_BASE=…` and nothing else: looking one up by hand is the
+# step that makes that build awkward, and the official digest is the one a
+# mirror should be serving anyway — bytes that do not match it fail the build,
+# which is the point of pointing at a mirror. Set this to override the pin, and
+# note that for any other version the digest is looked up in the official
+# release index instead — go.dev serves the per-file checksum URL as an HTML
+# page rather than the digest, so the JSON index is the machine-readable
+# source. The build fails rather than skipping the check either way.
+ARG GO_SHA256=""
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl jq; \
+    arch="${TARGETARCH:-amd64}"; \
+    archive="go${GO_VERSION}.linux-${arch}.tar.gz"; \
+    curl -fsSLo /tmp/go.tar.gz "${GO_DIST_BASE}/${archive}"; \
+    expected="${GO_SHA256}"; \
+    if [ -z "${expected}" ]; then \
+      case "${archive}" in \
+        go1.25.1.linux-amd64.tar.gz) \
+          expected="7716a0d940a0f6ae8e1f3b3f4f36299dc53e31b16840dbd171254312c41ca12e" ;; \
+        go1.25.1.linux-arm64.tar.gz) \
+          expected="65a3e34fb2126f55b34e1edfc709121660e1be2dee6bdf405fc399a63a95a87d" ;; \
+      esac; \
+    fi; \
+    if [ -z "${expected}" ]; then \
+      expected="$(curl -fsSL "https://go.dev/dl/?mode=json&include=all" \
+        | jq -r --arg f "${archive}" '[.[].files[] | select(.filename==$f)][0].sha256')"; \
+    fi; \
+    if [ -z "${expected}" ] || [ "${expected}" = "null" ]; then \
+      echo "no sha256 available for ${archive}; pass GO_SHA256 explicitly" >&2; \
+      exit 1; \
+    fi; \
+    echo "${expected}  /tmp/go.tar.gz" | sha256sum -c -; \
+    tar -C /usr/local -xzf /tmp/go.tar.gz; \
+    /usr/local/go/bin/go version
+
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="Sandloom Base (polyglot)" \
+      org.opencontainers.image.description="Bubblewrap runtime with Go, Rust, and JVM toolchains"
+
+ARG RUST_VERSION=1.90.0
+# rustup honours these, so a deployment behind a mirror redirects the whole
+# toolchain download without patching this file.
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+ARG RUSTUP_INIT_URL=https://sh.rustup.rs
+# Debian bookworm carries OpenJDK 17; 21 is in bookworm-backports. Naming a
+# version the base distribution does not ship makes the build fail outright
+# with "Unable to locate package", so the default follows the distribution and
+# the argument is there for a deployment on a newer base.
+ARG JDK_PACKAGE=openjdk-17-jdk-headless
+
+# The JDK and build essentials come from the distribution: a reproducible
+# version is less valuable here than staying on the distribution's security
+# updates, and the sandbox never compiles the image itself.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential maven "${JDK_PACKAGE}" pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=go-toolchain /usr/local/go /usr/local/go
+
+# rustup installs into CARGO_HOME/RUSTUP_HOME. Those are set here to image-wide
+# locations so the toolchain is shared and read-only; the runtime points each
+# sandbox's CARGO_HOME at its own /envs tree for anything it installs itself.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/go/bin:/usr/local/cargo/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN set -eux; \
+    export RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER}" \
+           RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT}"; \
+    curl -fsSL "${RUSTUP_INIT_URL}" \
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_VERSION}"; \
+    chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}"; \
+    rustc --version; \
+    cargo --version
+
+COPY scripts/install-polyglot-launchers.py /tmp/install-polyglot-launchers.py
+RUN python /tmp/install-polyglot-launchers.py \
+    && rm /tmp/install-polyglot-launchers.py
+
+ENV SANDBOX_JAVA_HOME=/usr/local/lib/agent-sandbox/java \
+    SANDBOX_RUST_LAUNCHER_DIR=/usr/local/lib/agent-sandbox/rust/bin
+
+RUN command -v go rustc cargo javac java mvn \
+    && go version \
+    && java -version
+
+WORKDIR /app
+ENTRYPOINT ["/usr/bin/tini", "--"]

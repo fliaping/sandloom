@@ -1,0 +1,35 @@
+# Linux test runner for the isolation suite.
+#
+# The Bubblewrap tests cannot run on a macOS or Windows host: they assert on
+# namespaces, UID drops, and rlimits that only exist on Linux. This image gives
+# them a real kernel to run against, with the same bwrap build the production
+# image ships so the probe negotiates the same level.
+#
+#   ./scripts/integration-test.sh sandbox
+
+ARG BASE_IMAGE=agent-sandbox-base:latest
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+ENV PYTHONPATH=/app/src \
+    SANDBOX_BUBBLEWRAP_PATH=/usr/bin/bwrap \
+    SANDBOX_SETPRIV_PATH=/usr/bin/setpriv \
+    SANDBOX_PRLIMIT_PATH=/usr/bin/prlimit \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+
+COPY pyproject.toml uv.lock README.md ./
+COPY runtime ./runtime
+COPY src ./src
+
+# Dev dependencies carry pytest; the extras carry the middleware drivers the
+# integration suite connects with.
+RUN uv sync --frozen --all-extras
+
+# `tests` is in .dockerignore so the production image stays lean, so the suite is
+# bind-mounted at run time instead. That also means editing a test does not
+# require a rebuild.
+VOLUME ["/app/tests"]
+
+# The suite runs as root on purpose: dropping to a sandbox UID is the behavior
+# under test, and only root can do it.
+CMD ["uv", "run", "--no-sync", "pytest", "tests/integration/test_bubblewrap_isolation.py", "-v"]

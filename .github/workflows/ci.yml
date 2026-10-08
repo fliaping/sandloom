@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Install project
+        run: uv sync --frozen
+      - name: Test control plane
+        run: uv run pytest -q
+      - name: Test runtime package
+        run: uv run pytest -q runtime/tests
+      - name: Lint
+        if: matrix.python-version == '3.13'
+        # `examples` and `scripts` too: they are what a reader runs first, and
+        # nothing else in this file would notice them breaking.
+        run: uv run ruff check src runtime/src tests runtime/tests examples scripts
+      - name: Type check
+        if: matrix.python-version == '3.13'
+        run: uv run mypy src runtime/src scripts examples
+
+  integration:
+    name: Integration (real middleware)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Install project with every adapter extra
+        run: uv sync --frozen --all-extras
+      - name: Start middleware
+        # --wait blocks on the healthchecks, so the suite never races a cold server.
+        run: docker compose -f compose.integration.yaml up -d --wait
+      - name: Test adapters against real servers
+        run: |
+          uv run pytest tests/integration \
+            --ignore=tests/integration/test_bubblewrap_isolation.py -q
+      - name: Dump middleware logs on failure
+        if: failure()
+        run: docker compose -f compose.integration.yaml logs --tail 100
+      - name: Stop middleware
+        if: always()
+        run: docker compose -f compose.integration.yaml down -v
+
+  isolation:
+    name: Bubblewrap isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the base image
+        run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
+      - name: Build the test image
+        run: docker build -f Dockerfile.test -t agent-sandbox-test:latest .
+      - name: Prove the sandbox boundary
+        # systempaths=unconfined is required because Docker masks paths under
+        # /proc, which would force the probe down to `basic` and silently stop
+        # testing the PID and cgroup namespaces.
+        run: |
+          docker run --rm \
+            --cap-add SYS_ADMIN \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            --security-opt systempaths=unconfined \
+            -v "$PWD/tests:/app/tests:ro" \
+            agent-sandbox-test:latest \
+            uv run --no-sync pytest \
+              tests/integration/test_bubblewrap_isolation.py \
+              tests/integration/test_template_isolation.py -v
+
+  fleet:
+    name: Fleet (two replicas)
+    runs-on: ubuntu-latest
+    # Job level because every step that runs Compose needs the token: the fleet
+    # file requires it, and interpolating without it is an error rather than a
+    # default. The heartbeat is shortened so the checks that wait for a registry
+    # entry to expire, and for the fleet view to drop a stopped worker, finish in
+    # seconds rather than minutes.
+    env:
+      SANDBOX_INTERNAL_TOKEN: fleet-verification-token
+      SANDBOX_HEARTBEAT_INTERVAL_SECONDS: "2"
+      SANDBOX_HEARTBEAT_TTL_SECONDS: "10"
+      SANDBOX_MAINTENANCE_INTERVAL_SECONDS: "2"
+      SANDBOX_IDLE_TTL_SECONDS: "45"
+      SANDBOX_ORPHAN_RELEASE_GRACE_SECONDS: "10"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Install project
+        run: uv sync --frozen
+      - name: Build the base image
+        run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
+      - name: Start replicas over a shared database and registry
+        # The third replica runs with a different SANDBOX_PROFILE_HASH, behind the
+        # fleet file's `other-profile` profile, so the checks that depend on a
+        # fleet that is not uniform have one to look at.
+        run: docker compose -f compose.fleet.yaml --profile other-profile up -d --wait --build
+      - name: Verify what a fleet promises
+        # The single-replica deployment job cannot see any of this: a request
+        # forwarded to the replica that owns the sandbox, a template built on one
+        # worker and mounted by a sandbox on the other, a worker that stops
+        # answering producing a refusal instead of an answer from stale state, and
+        # the reaper reclaiming what that worker owned. `--short-graces` says the
+        # periods above are the shortened ones, so the checks that wait for the
+        # reaper run rather than skip.
+        run: uv run python scripts/verify-fleet.py --strict --short-graces
+      - name: Fleet logs on failure
+        if: failure()
+        run: docker compose -f compose.fleet.yaml --profile other-profile logs --tail 200
+      - name: Stop
+        if: always()
+        run: docker compose -f compose.fleet.yaml --profile other-profile down -v
+
+  package:
+    name: Release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Scan the source tree for internal markers
+        # First, because it is the cheapest gate and the one whose failure is a
+        # leak: everything below builds from this tree. The scanner is standard
+        # library only, so it runs before the project is installed, on bare
+        # python.
+        run: python3 scripts/scan_public_tree.py .
+      - name: Build control plane
+        run: uv build --out-dir dist
+      - name: Build runtime
+        working-directory: runtime
+        run: uv build --out-dir dist
+      - name: Scan the built distributions
+        # A wheel and an sdist are assembled from the same tree but not by the
+        # same rules: both carry metadata the tree does not have, and the sdist
+        # is packed by a tool this repository does not control.
+        run: |
+          for artifact in dist/*.whl dist/*.tar.gz; do
+            python3 scripts/scan_public_tree.py "${artifact}"
+          done
+      - name: Generate the SBOM
+        # The Python content of the image, checked against the lock by
+        # tests/test_sbom.py so it cannot quietly describe the wrong set.
+        run: ./scripts/generate-sbom.sh dist
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/agent-sandbox.cdx.json
+      - name: Verify the distributions install and run as a pair
+        # Reads neither the tree nor the lock: it installs the built wheels the
+        # way a user does, which is the only place the application's requirement
+        # on the runtime resolves against an index rather than against `runtime/`.
+        run: ./scripts/verify-distributions.sh
+      - name: Audit the locked dependencies
+        # From the lock alone, so this reports what would be installed rather
+        # than what happens to be in a virtualenv here. `--no-deps` because every
+        # requirement is already listed, and `osv` because pip-audit's default
+        # service is the one most likely to be unreachable or rate-limited.
+        run: |
+          uv export --frozen --no-dev --all-extras --no-hashes \
+            | uvx pip-audit --no-deps --disable-pip --vulnerability-service osv -r /dev/stdin
+
+  deployment:
+    name: Deployment verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Install project
+        run: uv sync --frozen
+      - name: Build the base image
+        # The two commands the README gives a first-time reader, in order. The
+        # service image is FROM agent-sandbox-base, so `compose up` alone fails
+        # on a machine that has never built it.
+        run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
+      - name: Start the deployment the README describes
+        env:
+          SANDBOX_INTERNAL_TOKEN: ci-verification-token
+        run: docker compose up -d --wait --build
+      - name: Scan the image for internal markers
+        # What the build context put in the image, rather than the whole
+        # filesystem: the base image's keyrings, CA bundle and third-party code
+        # produce tens of thousands of findings on their own. The script targets
+        # /app and refuses to run when /app holds no application code, so a
+        # "clean" answer cannot mean "looked at nothing".
+        env:
+          SANDBOX_INTERNAL_TOKEN: ci-verification-token
+        run: ./scripts/scan-image.sh
+      - name: Prove the image scan fails on an image that carries one
+        # A gate that has only ever been seen pass may be wired to nothing. This
+        # builds one layer on top of the image just scanned, whose build argument
+        # names an internal mirror: BuildKit records the resolved value in the
+        # layer history, and `RUN ... >/dev/null` keeps it out of the filesystem,
+        # so the scan below twice reports /app clean and then fails on the
+        # history. The hostname is assembled from two halves so this file does
+        # not itself contain a marker — the tree scan in the `package` job would
+        # otherwise fail on it.
+        env:
+          MIRROR_HOST: mirrors
+          MIRROR_DOMAIN: .corp.example.com
+        run: |
+          image=$(docker compose config --images | head -1)
+          # The `${RUSTUP_DIST_SERVER}` in the file being printed stays literal on
+          # purpose: it is expanded by the Docker build, not by this shell.
+          # shellcheck disable=SC2016
+          printf 'FROM %s\nARG RUSTUP_DIST_SERVER=https://public.example.com\nRUN echo "${RUSTUP_DIST_SERVER}" >/dev/null\n' "${image}" \
+            | docker build -q --build-arg "RUSTUP_DIST_SERVER=https://${MIRROR_HOST}${MIRROR_DOMAIN}/rustup" \
+                -t agent-sandbox-scan-probe:latest -
+
+          status=0
+          ./scripts/scan-image.sh agent-sandbox-scan-probe:latest || status=$?
+          docker rmi -f agent-sandbox-scan-probe:latest >/dev/null
+
+          if [[ "${status}" -eq 0 ]]; then
+            echo "the image scan passed an image whose history names an internal host" >&2
+            exit 1
+          fi
+      - name: Verify it as a client
+        # --strict so a skipped check fails: a deployment that verified half of
+        # what it claims is not verified. This is also the only thing that runs
+        # `examples/`, so an example cannot rot into a script that misleads.
+        env:
+          SANDBOX_INTERNAL_TOKEN: ci-verification-token
+        run: uv run python scripts/verify-deployment.py --strict
+      - name: Deployment logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+      - name: Stop
+        if: always()
+        run: docker compose down -v

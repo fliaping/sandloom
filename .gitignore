@@ -1,0 +1,30 @@
+# Local configuration and workspace data.
+.env
+data/
+*.db
+*.sqlite*
+
+# Python environments and bytecode.
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local analysis and test caches.
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local IDE and operating-system metadata.
+.idea/
+.DS_Store
+
+# Build output: `uv build`, and the wheels the README tells you to install.
+dist/
+build/
+*.egg-info/
+
+# Coverage output: `pytest --cov`, which the release scan also skips.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

@@ -1,0 +1,198 @@
+# A fleet, not a deployment.
+#
+# `compose.yaml` is one replica on SQLite with an in-process registry, and that is
+# the right default: two replicas share neither of those by accident, and a
+# deployment that quietly half-works is worse than one that refuses to start. This
+# file is the shape README's "More than one replica" describes — the same image
+# twice over a shared metadata database, a shared registry, and object storage —
+# as something to run rather than a fragment to assemble.
+#
+#   export SANDBOX_INTERNAL_TOKEN=$(openssl rand -hex 32)
+#   docker compose -f compose.fleet.yaml up -d --wait
+#   curl -s -H "Authorization: Bearer $SANDBOX_INTERNAL_TOKEN" \
+#       http://127.0.0.1:18081/api/v1/admin/overview
+#
+# `./scripts/verify-fleet.py` drives both replicas as a client and checks the
+# promises that section makes: a request landing on the replica that does not own
+# the sandbox is forwarded rather than refused, a template built on one worker is
+# mounted by a sandbox on the other, a superseded generation is refused, a worker
+# that stops answering produces a refusal instead of a wrong answer, and what it
+# owned is reclaimed. The checks that wait for a reaper need the periods below
+# shortened, which is what the script's usage line does and what `--short-graces`
+# acknowledges; a fleet that keeps the shipped ones reclaims nothing on the
+# timescale a job can wait.
+#
+# The project name is set so this fleet never shares containers, networks or
+# volumes with the single-replica quick start in the same checkout.
+name: agent-sandbox-fleet
+
+# What both replicas have in common. They are the same image with the same
+# settings, which is the property the README turns on: two replicas that differ
+# in `SANDBOX_PROFILE_HASH` still register and still appear in the fleet view, but
+# each places sandboxes only on workers whose profile matches its own.
+x-worker: &worker
+  build:
+    context: .
+  # See the note in compose.yaml: Docker's default seccomp profile blocks the
+  # nested namespace syscalls Bubblewrap needs, and privileged is not a
+  # substitute — agent commands still run inside the negotiated boundary.
+  security_opt:
+    - seccomp=unconfined
+  # The settings that make this a fleet rather than two unrelated services. Each
+  # one is a thing two processes cannot share by accident.
+  environment: &fleet
+    SANDBOX_INTERNAL_TOKEN: ${SANDBOX_INTERNAL_TOKEN:?set SANDBOX_INTERNAL_TOKEN}
+    SANDBOX_DATABASE_URL: postgresql+asyncpg://sandbox:sandbox@fleet-db/agent_sandbox
+    # The schema is created by whichever replica gets there first, and the others
+    # must survive that race — which is why this is on in every replica here
+    # rather than applied out of band.
+    SANDBOX_DATABASE_AUTO_DDL: "true"
+    SANDBOX_REGISTRY_BACKEND: redis
+    SANDBOX_REDIS_URL: redis://fleet-registry:6379/0
+    BLOBSTORE_ENDPOINT: http://fleet-store:4566
+    BLOBSTORE_BUCKET: agent-sandbox-templates
+    BLOBSTORE_REGION: us-east-1
+    # LocalStack accepts anything; naming them explicitly skips the boto3 chain
+    # and the preflight warning about an endpoint with no credentials.
+    BLOBSTORE_ACCESS_KEY: fleet
+    BLOBSTORE_SECRET_KEY: fleet-secret
+    SANDBOX_ISOLATION_LEVEL: auto
+    SANDBOX_NETWORK_MODE: host
+    SANDBOX_LOCAL_ROOT: /var/lib/agent-sandbox/sandboxes
+    # Interpolated so `./scripts/verify-fleet.py` can shorten what it has to wait
+    # for; the defaults are the ones this project ships. A worker's registry entry
+    # expires on the TTL, and the reaper releases a sandbox whose worker went away
+    # once the grace has passed. The TTL has to stay above twice the interval or
+    # the service refuses to start, which is the intended behavior and not a
+    # setting to soften here.
+    SANDBOX_HEARTBEAT_INTERVAL_SECONDS: ${SANDBOX_HEARTBEAT_INTERVAL_SECONDS:-10}
+    SANDBOX_HEARTBEAT_TTL_SECONDS: ${SANDBOX_HEARTBEAT_TTL_SECONDS:-30}
+    SANDBOX_MAINTENANCE_INTERVAL_SECONDS: ${SANDBOX_MAINTENANCE_INTERVAL_SECONDS:-60}
+    SANDBOX_IDLE_TTL_SECONDS: ${SANDBOX_IDLE_TTL_SECONDS:-1800}
+    SANDBOX_ORPHAN_RUNNING_GRACE_SECONDS: ${SANDBOX_ORPHAN_RUNNING_GRACE_SECONDS:-60}
+    SANDBOX_ORPHAN_RELEASE_GRACE_SECONDS: ${SANDBOX_ORPHAN_RELEASE_GRACE_SECONDS:-300}
+  # `.env` is what the quick start tells you to copy, so the settings it holds
+  # belong in both replicas too; `environment:` above wins where this file has to
+  # own the wiring. `required: false` keeps the file usable without one.
+  env_file:
+    - path: .env
+      required: false
+  depends_on:
+    fleet-db:
+      condition: service_healthy
+    fleet-registry:
+      condition: service_healthy
+    fleet-store:
+      condition: service_healthy
+
+services:
+  # The metadata store. SQLite is a single writer, so it caps the fleet at the
+  # command rate of one process; PostgreSQL is what makes a second replica worth
+  # having (docs/SIZING.md measures 25 cmd/s against 35, on one worker each).
+  fleet-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sandbox
+      POSTGRES_PASSWORD: sandbox
+      POSTGRES_DB: agent_sandbox
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sandbox -d agent_sandbox"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # A verification fleet is not a database you keep.
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  # The registry: which workers are live, what they advertise, and how loaded
+  # they are. An in-process registry would let each replica see only itself, so
+  # every request would look like it landed on the owner.
+  fleet-registry:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Object storage, for the one thing the two replicas cannot exchange over the
+  # internal API: a template's archive, which has to be readable by whichever
+  # worker materializes it. LocalStack rather than MinIO because the MinIO images
+  # on Docker Hub now require authentication to pull; `4.5` rather than `stable`,
+  # because that tag resolves to the Pro image, which exits without a licence.
+  fleet-store:
+    image: localstack/localstack:4.5
+    environment:
+      SERVICES: s3
+      DEBUG: "0"
+      AWS_DEFAULT_REGION: us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4566/_localstack/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    ports:
+      # Published only so the verification script can create the bucket; the
+      # replicas reach the store by service name.
+      - "18090:4566"
+    tmpfs:
+      - /var/lib/localstack
+
+  worker-a:
+    <<: *worker
+    environment:
+      <<: *fleet
+      # The name peers resolve. `SANDBOX_WORKER_ID` is derived from it and the
+      # port, and the endpoint a peer forwards to is
+      # `http://${SANDBOX_ADVERTISE_HOST}:${SANDBOX_PORT}` — a Compose service
+      # name is reachable from the other replica and from nothing else, which is
+      # exactly the visibility an internal protocol should have.
+      SANDBOX_ADVERTISE_HOST: worker-a
+    ports:
+      - "18081:8080"
+    volumes:
+      - worker-a-data:/var/lib/agent-sandbox
+
+  worker-b:
+    <<: *worker
+    environment:
+      <<: *fleet
+      SANDBOX_ADVERTISE_HOST: worker-b
+    ports:
+      - "18082:8080"
+    volumes:
+      - worker-b-data:/var/lib/agent-sandbox
+
+  # A third replica that does *not* match the other two: same image, same
+  # database, same registry, one setting different. `SANDBOX_PROFILE_HASH` is what
+  # a replica compares before placing a sandbox on a worker, so this one is listed
+  # as live and receives nothing from the other two — the failure that shows up
+  # when half a fleet is rebuilt and nobody notices until requests start landing
+  # on workers built from the other configuration.
+  #
+  # Behind a profile, because a two-replica fleet is the useful default and this
+  # one exists to be pointed at:
+  #
+  #   docker compose -f compose.fleet.yaml --profile other-profile up -d --wait
+  worker-c:
+    <<: *worker
+    profiles:
+      - other-profile
+    environment:
+      <<: *fleet
+      SANDBOX_ADVERTISE_HOST: worker-c
+      SANDBOX_PROFILE_HASH: bubblewrap-0.11.2-generic-v12-other
+    ports:
+      - "18083:8080"
+    volumes:
+      - worker-c-data:/var/lib/agent-sandbox
+
+volumes:
+  # One per worker, and deliberately not shared: a sandbox's workspace is local
+  # to the worker that owns it, and a volume shared between replicas would let two
+  # of them write to one workspace and hide the failure this file is here to
+  # expose.
+  worker-a-data:
+  worker-b-data:
+  worker-c-data:
