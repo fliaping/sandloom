@@ -308,6 +308,8 @@ MCP_TOOLS = {
     "sandbox_write_file",
     "sandbox_read_file",
     "sandbox_release",
+    "sandbox_suspend",
+    "sandbox_resume",
 }
 
 
