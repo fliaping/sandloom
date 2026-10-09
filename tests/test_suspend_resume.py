@@ -917,13 +917,11 @@ def _age(marker: Path, seconds: float) -> None:
 async def test_an_orphaned_directory_is_deleted_only_after_its_ttl(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     active = await _live(runtime, "sb-active")
-    dormant = await _live(runtime, "sb-dormant")
-    await runtime.suspend("sb-dormant", 1)
     stale = await _live(runtime, "sb-stale")
     # What a resume elsewhere leaves: a directory no sandbox here holds.
     runtime.sandboxes.pop("sb-stale")
 
-    # Live and dormant sandboxes are never even listed.
+    # A live sandbox is never even listed.
     assert await runtime.local_workspace_ids() == ["sb-stale"]
 
     # The first sighting starts the clock and deletes nothing.
@@ -943,29 +941,41 @@ async def test_an_orphaned_directory_is_deleted_only_after_its_ttl(tmp_path: Pat
     assert not stale.root.exists()
     assert not marker.exists()
     assert (active.workspace / "notes.txt").exists()
-    assert (dormant.workspace / "notes.txt").exists()
 
 
-async def test_a_sandbox_held_here_is_never_deleted_even_if_reported_orphaned(
+async def test_a_live_sandbox_is_never_deleted_even_if_reported_orphaned(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(tmp_path)
     active = await _live(runtime, "sb-active")
-    dormant = await _live(runtime, "sb-dormant")
-    await runtime.suspend("sb-dormant", 1)
     markers = runtime._orphan_marker_root()
     markers.mkdir(parents=True, exist_ok=True)
-    for name in ("sb-active", "sb-dormant"):
-        (markers / name).touch()
-        _age(markers / name, 10_000)
+    (markers / "sb-active").touch()
+    _age(markers / "sb-active", 10_000)
 
-    removed = await runtime.reclaim_orphan_workspaces(
-        ["sb-active", "sb-dormant"], ttl_seconds=60
-    )
-
-    assert removed == []
-    assert active.root.exists() and dormant.root.exists()
+    assert await runtime.reclaim_orphan_workspaces(["sb-active"], ttl_seconds=60) == []
+    assert active.root.exists()
     assert list(markers.iterdir()) == []
+
+
+async def test_a_dormant_entry_whose_route_was_released_elsewhere_is_reclaimed(
+    tmp_path: Path,
+) -> None:
+    """The route decides, not memory: a release that could not reach this
+    worker leaves a dormant entry here that nothing else would ever clear."""
+    runtime = _runtime(tmp_path)
+    dormant = await _live(runtime, "sb-dormant")
+    await runtime.suspend("sb-dormant", 1)
+
+    assert await runtime.local_workspace_ids() == ["sb-dormant"]
+    await runtime.reclaim_orphan_workspaces(["sb-dormant"], ttl_seconds=60)
+    _age(runtime._orphan_marker_root() / "sb-dormant", 61)
+
+    assert await runtime.reclaim_orphan_workspaces(["sb-dormant"], ttl_seconds=60) == [
+        "sb-dormant"
+    ]
+    assert not dormant.root.exists()
+    assert "sb-dormant" not in runtime.dormant
 
 
 async def test_an_orphan_that_is_owned_again_loses_its_clock(tmp_path: Path) -> None:
@@ -995,6 +1005,12 @@ async def test_the_old_worker_reclaims_the_copy_a_cross_worker_resume_left(
     await _api(app_a, "POST", "/api/v1/sandboxes/agent-1/suspend", json={"generation": generation})
     old_root = service_a.settings.workspace_root / "agent-1"
     markers = service_a.runtime._orphan_marker_root()
+
+    # Suspended here: listed (memory does not protect a dormant entry), but
+    # its route names worker A, so no clock starts.
+    await service_a._maintenance()
+    assert old_root.exists()
+    assert not (markers / "agent-1").exists()
 
     # Suspended here, and worker A restarted (its memory of the dormant
     # sandbox is gone): the route still names worker A, so it is kept.

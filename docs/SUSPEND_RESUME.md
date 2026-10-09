@@ -156,7 +156,10 @@ resumes or is released.
   becomes owned again loses its marker. A directory is never deleted while
   its route names this worker, whether the sandbox is active, suspended, or
   being created, even after a restart has emptied the worker's memory; nor is
-  one with no route, or a shared workspace. The deletion re-checks under the
+  one with no route, or a shared workspace. The route decides, not the
+  worker's memory: a suspended sandbox released while its worker was paused
+  or unreachable leaves a stale dormant entry there, and its directory is
+  still reclaimed. The deletion re-checks under the
   sandbox's lifecycle lock, so a sandbox that came back to this worker in the
   meantime keeps its directory.
 - **Stalled suspends.** A route left in `SUSPENDING` (for example, the worker

@@ -981,14 +981,17 @@ class SandboxRuntime:
         return self.settings.template_cache_root / ".orphan-workspaces"
 
     def _owned_here(self, sandbox_id: str) -> bool:
-        return (
-            sandbox_id in self.sandboxes
-            or sandbox_id in self.dormant
-            or sandbox_id in self._destroying
-        )
+        # Only what runs here, or is being released here, is protected by
+        # memory. A dormant entry is not: whether a sandbox is still suspended
+        # on this worker is the route's to say, and a route released while this
+        # worker was unreachable leaves a dormant entry behind that nothing
+        # else clears. The control plane never reports a sandbox whose route
+        # still names this worker, so a sandbox suspended here is never
+        # reported orphaned.
+        return sandbox_id in self.sandboxes or sandbox_id in self._destroying
 
     async def local_workspace_ids(self) -> list[str]:
-        """Directories under the workspace root that no live or dormant sandbox holds."""
+        """Directories under the workspace root that no live sandbox holds."""
         return await asyncio.to_thread(self._local_workspace_ids)
 
     def _local_workspace_ids(self) -> list[str]:
@@ -1053,6 +1056,10 @@ class SandboxRuntime:
                     if self._owned_here(sandbox_id):
                         marker.unlink(missing_ok=True)
                         continue
+                    # A dormant entry for a route released or moved elsewhere
+                    # is stale; it goes with the directory.
+                    self.dormant.pop(sandbox_id, None)
+                    self._attached_templates.pop(sandbox_id, None)
                     if root.exists() and (trashed := self._move_to_trash(sandbox_id, root)):
                         shutil.rmtree(trashed, True)
                     marker.unlink(missing_ok=True)
