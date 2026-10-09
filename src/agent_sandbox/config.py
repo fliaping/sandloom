@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # store is configured, `always` refuses to suspend without one, `never` keeps
     # the dormant workspace on its worker only.
     suspend_snapshot: str = "auto"
+    # How long a workspace directory this worker no longer owns (its sandbox
+    # resumed on another worker, or was released while this worker was away)
+    # stays on disk before the maintenance cycle deletes it. Counted from when
+    # the worker first saw it orphaned, by a marker on disk, so a restart does
+    # not reset it. 0 never deletes such directories.
+    orphan_dormant_dir_ttl_seconds: int = Field(default=24 * 3600, ge=0)
     disk_high_watermark_percent: int = 90
     min_free_bytes: int = 1024 * 1024 * 1024
 

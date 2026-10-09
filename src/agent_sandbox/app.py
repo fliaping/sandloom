@@ -201,6 +201,7 @@ def reclamation_periods(config: Settings) -> dict[str, float]:
         "orphan_running_grace_seconds": config.orphan_running_grace_seconds,
         "orphan_release_grace_seconds": config.orphan_release_grace_seconds,
         "suspended_retention_seconds": config.suspended_retention_seconds,
+        "orphan_dormant_dir_ttl_seconds": config.orphan_dormant_dir_ttl_seconds,
     }
 
 

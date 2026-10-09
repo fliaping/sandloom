@@ -15,6 +15,7 @@ from .backends import (
     DormantLifecycle,
     ExecutionBackend,
     as_dormant_lifecycle,
+    as_orphan_workspace_reclaim,
     as_template_cache_pruning,
     create_execution_backend,
 )
@@ -338,6 +339,7 @@ class SandboxService:
                 )
                 logger.exception("failed to reclaim orphaned sandbox: %s", route.sandbox_id)
         released += await self._reclaim_dormant()
+        await self._reclaim_orphan_workspaces()
         self.reaper_status.update(
             {
                 "last_run_at": datetime.now(UTC).isoformat(),
@@ -1024,6 +1026,44 @@ class SandboxService:
                 )
                 logger.exception("failed to reclaim suspended sandbox: %s", route.sandbox_id)
         return released
+
+    async def _reclaim_orphan_workspaces(self) -> int:
+        """Delete local workspace directories this worker no longer owns.
+
+        A directory is orphaned when its route is released, or points at
+        another worker: the sandbox resumed elsewhere from its snapshot, or was
+        reassigned while this worker was away. It is deleted once it has stayed
+        orphaned for `SANDBOX_ORPHAN_DORMANT_DIR_TTL_SECONDS`. A directory whose
+        route still names this worker (active, suspended, or being created) is
+        never a candidate, and neither is one with no route at all, which this
+        metadata store cannot vouch for. Shared workspaces are not this
+        worker's to delete.
+        """
+        ttl = self.settings.orphan_dormant_dir_ttl_seconds
+        if ttl <= 0 or self.settings.shared_root is not None:
+            return 0
+        runtime = as_orphan_workspace_reclaim(self.runtime)
+        if runtime is None:
+            return 0
+        try:
+            orphaned: list[str] = []
+            for sandbox_id in await runtime.local_workspace_ids():
+                route = await self.database.find_route(sandbox_id)
+                if route is None or route.storage_mode == "shared":
+                    continue
+                if route.status == "RELEASED" or route.worker_id != self.worker_id:
+                    orphaned.append(sandbox_id)
+            removed = await runtime.reclaim_orphan_workspaces(orphaned, ttl_seconds=ttl)
+        except Exception:
+            logger.exception("orphaned workspace reclamation failed; retrying next cycle")
+            return 0
+        for sandbox_id in removed:
+            logger.info("deleted orphaned workspace directory: sandbox_id=%s", sandbox_id)
+        if removed:
+            self.reaper_status["orphan_workspaces_deleted_total"] = cast(
+                int, self.reaper_status.get("orphan_workspaces_deleted_total", 0)
+            ) + len(removed)
+        return len(removed)
 
     async def refresh_capacity(self) -> None:
         """Publish a heartbeat now, so a released or retaken slot is visible at once."""

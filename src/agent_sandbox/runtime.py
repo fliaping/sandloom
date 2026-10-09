@@ -964,6 +964,104 @@ class SandboxRuntime:
             return None
         return target
 
+    # ── orphaned workspace directories ──
+    #
+    # A sandbox that resumed on another worker from its snapshot, or that was
+    # released while this worker was down, leaves its directory here. Only the
+    # control plane can tell that from the metadata store, so it passes in the
+    # ids it found orphaned; this side keeps the clock and does the deletion.
+    # The clock is a marker file per directory, created the first time the
+    # directory is reported orphaned, so a restarted worker keeps counting
+    # instead of starting over, and a directory that becomes owned again (or
+    # disappears) loses its marker.
+
+    def _orphan_marker_root(self) -> Path:
+        # Beside the lifecycle locks, outside every sandbox mount, and skipped
+        # by the template cache because of the leading dot.
+        return self.settings.template_cache_root / ".orphan-workspaces"
+
+    def _owned_here(self, sandbox_id: str) -> bool:
+        return (
+            sandbox_id in self.sandboxes
+            or sandbox_id in self.dormant
+            or sandbox_id in self._destroying
+        )
+
+    async def local_workspace_ids(self) -> list[str]:
+        """Directories under the workspace root that no live or dormant sandbox holds."""
+        return await asyncio.to_thread(self._local_workspace_ids)
+
+    def _local_workspace_ids(self) -> list[str]:
+        root = self.settings.workspace_root
+        if not root.is_dir():
+            return []
+        found: list[str] = []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name in _RESERVED_ROOT_NAMES or entry.name.startswith("."):
+                    continue
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if self._owned_here(entry.name):
+                    continue
+                found.append(entry.name)
+        return sorted(found)
+
+    async def reclaim_orphan_workspaces(
+        self, orphaned: list[str], *, ttl_seconds: int
+    ) -> list[str]:
+        """Delete the directories that have been orphaned for at least `ttl_seconds`.
+
+        `orphaned` is the full set the control plane found this cycle: a marker
+        for any id not in it is dropped, so ownership coming back resets the
+        clock. Returns the ids whose directory was deleted.
+        """
+        return await asyncio.to_thread(
+            self._reclaim_orphan_workspaces, set(orphaned), ttl_seconds, time.time()
+        )
+
+    def _reclaim_orphan_workspaces(
+        self, orphaned: set[str], ttl_seconds: int, now: float
+    ) -> list[str]:
+        markers = self._orphan_marker_root()
+        markers.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for marker in list(markers.iterdir()):
+            if marker.name not in orphaned:
+                marker.unlink(missing_ok=True)
+        removed: list[str] = []
+        for sandbox_id in sorted(orphaned):
+            try:
+                root = _sandbox_root(self.settings.workspace_root, sandbox_id)
+            except ValueError:
+                continue
+            marker = markers / sandbox_id
+            if root.is_symlink() or not root.is_dir() or self._owned_here(sandbox_id):
+                marker.unlink(missing_ok=True)
+                continue
+            try:
+                first_seen = marker.stat().st_mtime
+            except FileNotFoundError:
+                marker.touch(mode=0o600)
+                continue
+            if now - first_seen < ttl_seconds:
+                continue
+            try:
+                with self._template_lock(sandbox_id):
+                    # Re-checked under the lock every create, resume and
+                    # release takes: a sandbox that came back here meanwhile
+                    # keeps its directory.
+                    if self._owned_here(sandbox_id):
+                        marker.unlink(missing_ok=True)
+                        continue
+                    if root.exists() and (trashed := self._move_to_trash(sandbox_id, root)):
+                        shutil.rmtree(trashed, True)
+                    marker.unlink(missing_ok=True)
+                    removed.append(sandbox_id)
+            except RuntimeError:
+                # Busy: a create, resume or release holds the lock. Next cycle.
+                continue
+        return removed
+
     def _has_processes(self, sandbox_id: str) -> bool:
         return any(sid == sandbox_id for sid, _ in self.processes)
 
@@ -1242,8 +1340,11 @@ def _resolve_sandbox_path(sandbox: LocalSandbox, virtual_path: str) -> Path:
     raise ValueError(f"template source path must live under {allowed}")
 
 
+_RESERVED_ROOT_NAMES = frozenset({".trash", ".staging"})
+
+
 def _sandbox_root(workspace_root: Path, sandbox_id: str) -> Path:
-    if sandbox_id in {".trash", ".staging"}:
+    if sandbox_id in _RESERVED_ROOT_NAMES:
         raise ValueError("sandbox id uses a reserved name")
     root = workspace_root.resolve(strict=False)
     candidate = (root / sandbox_id).resolve(strict=False)

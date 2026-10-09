@@ -669,6 +669,7 @@ async def test_overview_reports_the_periods_this_replica_reclaims_on(tmp_path: P
         "orphan_running_grace_seconds": 7,
         "orphan_release_grace_seconds": 10,
         "suspended_retention_seconds": 604800,
+        "orphan_dormant_dir_ttl_seconds": 86400,
     }
 
 

@@ -114,6 +114,31 @@ def as_dormant_lifecycle(backend: object) -> DormantLifecycle | None:
     return cast("DormantLifecycle", backend)
 
 
+class OrphanWorkspaceReclaim(Protocol):
+    """Deleting workspace directories this worker no longer owns.
+
+    The worker lists its local directories; the control plane decides which of
+    them are orphaned from the metadata store; the worker deletes those that
+    have stayed orphaned for the configured period. Optional, like the other
+    capabilities here. Narrow with `as_orphan_workspace_reclaim()`.
+    """
+
+    async def local_workspace_ids(self) -> list[str]: ...
+    async def reclaim_orphan_workspaces(
+        self, orphaned: list[str], *, ttl_seconds: int
+    ) -> list[str]: ...
+
+
+def as_orphan_workspace_reclaim(backend: object) -> OrphanWorkspaceReclaim | None:
+    """Narrow a backend to orphaned-directory reclamation, or report that it cannot."""
+    if backend is None:
+        return None
+    required = ("local_workspace_ids", "reclaim_orphan_workspaces")
+    if not all(callable(getattr(backend, name, None)) for name in required):
+        return None
+    return cast("OrphanWorkspaceReclaim", backend)
+
+
 def create_execution_backend(settings: Settings) -> ExecutionBackend:
     """Load the explicitly configured backend.
 

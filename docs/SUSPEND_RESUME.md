@@ -129,12 +129,29 @@ resumes or is released.
   disk recovers. They stay `SUSPENDED` and resume from the snapshot. A dormant
   sandbox without a snapshot is never evicted for disk; its directory is the
   only copy.
+- **Copies left on the original worker.** A sandbox that resumed on another
+  worker from its snapshot leaves its old directory on the worker it left (as
+  does a sandbox released while its worker was down). Each worker's
+  maintenance cycle lists its local directories and checks their routes: one
+  whose route is `RELEASED` or names another worker is orphaned. It is
+  deleted once it has stayed orphaned for
+  `SANDBOX_ORPHAN_DORMANT_DIR_TTL_SECONDS` (default 86400, 24 hours; `0`
+  keeps it). The clock is a marker file under the template cache root
+  (`.orphan-workspaces/<sandbox_id>`), written the first time the directory is
+  seen orphaned, so a worker restart does not reset it; a directory that
+  becomes owned again loses its marker. A directory is never deleted while
+  its route names this worker, whether the sandbox is active, suspended, or
+  being created, even after a restart has emptied the worker's memory; nor is
+  one with no route, or a shared workspace. The deletion re-checks under the
+  sandbox's lifecycle lock, so a sandbox that came back to this worker in the
+  meantime keeps its directory.
 - **Stalled suspends.** A route left in `SUSPENDING` (for example, the worker
   was unreachable) for longer than `SANDBOX_ORPHAN_RELEASE_GRACE_SECONDS` is
   finished by the next maintenance cycle.
 
 `/healthz` and the admin overview report the retention period under
-`reclamation.suspended_retention_seconds`.
+`reclamation.suspended_retention_seconds`, and the orphaned-directory period
+under `reclamation.orphan_dormant_dir_ttl_seconds`.
 
 ## Limitations
 
@@ -143,9 +160,6 @@ resumes or is released.
 - Disk eviction is tracked in the worker's memory. A worker that restarts
   forgets which dormant copies it evicted; their resume still restores from the
   snapshot because the directory is missing.
-- A sandbox that resumed on another worker from its snapshot leaves its old
-  directory on the original worker. Nothing deletes that stale copy when the
-  original worker comes back; budget its disk or clean it out of band.
 - With local storage and no snapshot, a worker that never comes back takes the
   dormant workspace with it, exactly as it would take a running one. Retention
   eventually releases the route.

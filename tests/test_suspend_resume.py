@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import shutil
+import time
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -900,3 +901,134 @@ async def test_retention_expiry_releases_and_reclaims_the_disk(fleet: Any) -> No
     assert not root.exists()
     assert "agent-1" not in service.runtime.dormant
     assert store.keys() == []
+
+
+# ── workspace directories left behind on a worker that no longer owns them ──
+
+
+def _age(marker: Path, seconds: float) -> None:
+    then = time.time() - seconds
+    os.utime(marker, (then, then))
+
+
+async def test_an_orphaned_directory_is_deleted_only_after_its_ttl(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    active = await _live(runtime, "sb-active")
+    dormant = await _live(runtime, "sb-dormant")
+    await runtime.suspend("sb-dormant", 1)
+    stale = await _live(runtime, "sb-stale")
+    # What a resume elsewhere leaves: a directory no sandbox here holds.
+    runtime.sandboxes.pop("sb-stale")
+
+    # Live and dormant sandboxes are never even listed.
+    assert await runtime.local_workspace_ids() == ["sb-stale"]
+
+    # The first sighting starts the clock and deletes nothing.
+    assert await runtime.reclaim_orphan_workspaces(["sb-stale"], ttl_seconds=3600) == []
+    marker = runtime._orphan_marker_root() / "sb-stale"
+    assert marker.exists() and stale.root.exists()
+    _age(marker, 3000)
+    assert await runtime.reclaim_orphan_workspaces(["sb-stale"], ttl_seconds=3600) == []
+    assert stale.root.exists()
+
+    # A restarted worker reads the clock from disk instead of starting over.
+    restarted = _runtime(tmp_path)
+    _age(marker, 3601)
+    assert await restarted.reclaim_orphan_workspaces(["sb-stale"], ttl_seconds=3600) == [
+        "sb-stale"
+    ]
+    assert not stale.root.exists()
+    assert not marker.exists()
+    assert (active.workspace / "notes.txt").exists()
+    assert (dormant.workspace / "notes.txt").exists()
+
+
+async def test_a_sandbox_held_here_is_never_deleted_even_if_reported_orphaned(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    active = await _live(runtime, "sb-active")
+    dormant = await _live(runtime, "sb-dormant")
+    await runtime.suspend("sb-dormant", 1)
+    markers = runtime._orphan_marker_root()
+    markers.mkdir(parents=True, exist_ok=True)
+    for name in ("sb-active", "sb-dormant"):
+        (markers / name).touch()
+        _age(markers / name, 10_000)
+
+    removed = await runtime.reclaim_orphan_workspaces(
+        ["sb-active", "sb-dormant"], ttl_seconds=60
+    )
+
+    assert removed == []
+    assert active.root.exists() and dormant.root.exists()
+    assert list(markers.iterdir()) == []
+
+
+async def test_an_orphan_that_is_owned_again_loses_its_clock(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    stale = await _live(runtime, "sb-stale")
+    runtime.sandboxes.pop("sb-stale")
+    await runtime.reclaim_orphan_workspaces(["sb-stale"], ttl_seconds=60)
+    marker = runtime._orphan_marker_root() / "sb-stale"
+    _age(marker, 120)
+
+    # The control plane stopped reporting it: its route points here again.
+    assert await runtime.reclaim_orphan_workspaces([], ttl_seconds=60) == []
+    assert not marker.exists()
+    # Reported again later, the clock starts from zero.
+    assert await runtime.reclaim_orphan_workspaces(["sb-stale"], ttl_seconds=60) == []
+    assert stale.root.exists()
+
+
+async def test_the_old_worker_reclaims_the_copy_a_cross_worker_resume_left(
+    fleet: Any, tmp_path: Path
+) -> None:
+    transport, store, apps = fleet
+    app_a = apps[0]
+    service_a = app_a.state.sandbox_service
+    service_a.settings.orphan_dormant_dir_ttl_seconds = 60
+    generation = await _ready_sandbox(app_a)
+    await _api(app_a, "POST", "/api/v1/sandboxes/agent-1/suspend", json={"generation": generation})
+    old_root = service_a.settings.workspace_root / "agent-1"
+    markers = service_a.runtime._orphan_marker_root()
+
+    # Suspended here, and worker A restarted (its memory of the dormant
+    # sandbox is gone): the route still names worker A, so it is kept.
+    service_a.runtime.dormant.clear()
+    await service_a._maintenance()
+    assert old_root.exists()
+    assert not (markers / "agent-1").exists()
+
+    registry = service_a.registry
+    app_b = await _worker_app(tmp_path, "worker-b", transport, store, registry=registry)
+    apps.append(app_b)
+    service_b = app_b.state.sandbox_service
+    service_b.settings.orphan_dormant_dir_ttl_seconds = 60
+    await registry.unregister(service_a.worker_id)
+    resumed = await _api(app_b, "POST", "/api/v1/sandboxes/agent-1/resume")
+    assert resumed.json()["workspace_source"] == "restored"
+
+    # Worker A sees the copy is no longer its own and starts the clock.
+    await service_a._maintenance()
+    assert old_root.exists()
+    assert (markers / "agent-1").exists()
+    _age(markers / "agent-1", 61)
+    await service_a._maintenance()
+
+    assert not old_root.exists()
+    assert service_a.reaper_status["orphan_workspaces_deleted_total"] == 1
+    # The active copy on worker B is its own and stays.
+    await service_b._maintenance()
+    assert not (service_b.runtime._orphan_marker_root() / "agent-1").exists()
+    content = await _read(app_b, generation + 1)
+    assert base64.b64decode(content.json()["content_base64"]) == b"step 41 of 90"
+
+
+async def test_a_ttl_of_zero_keeps_orphaned_directories(fleet: Any) -> None:
+    _, _, (app,) = fleet
+    service = app.state.sandbox_service
+    service.settings.orphan_dormant_dir_ttl_seconds = 0
+    service.runtime.local_workspace_ids = None  # would fail if it were consulted
+
+    assert await service._reclaim_orphan_workspaces() == 0

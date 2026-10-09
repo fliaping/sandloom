@@ -76,6 +76,10 @@ sandbox is pinned rather than evicted:
   with reason `SUSPEND_EXPIRED`, deleting its directory and snapshot. Under
   disk pressure the same cycle first drops local copies of suspended sandboxes
   that have a snapshot. See [Suspend and resume](SUSPEND_RESUME.md).
+- **Directories a worker no longer owns.** A local workspace directory whose
+  route is released or names another worker (a resume landed elsewhere) is
+  deleted by its worker after `SANDBOX_ORPHAN_DORMANT_DIR_TTL_SECONDS`
+  (24 hours by default), timed by a marker on disk so a restart keeps the clock.
 
 A client that was waiting on the execution sees its connection to that worker
 drop. That is not recoverable at the point of failure: the guarantee is that
