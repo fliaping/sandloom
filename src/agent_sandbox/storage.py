@@ -103,6 +103,56 @@ def as_exec_history_pruning(store: object) -> ExecHistoryPruning | None:
     return cast("ExecHistoryPruning", store)
 
 
+class DormantRouteStore(Protocol):
+    """Route transitions for suspend and resume.
+
+    A separate capability, like `ExecHistoryPruning`: a metadata plugin written
+    against an earlier release keeps working, and suspend/resume answer 501 on
+    it. Every method is a compare-and-set on (sandbox_id, generation, status),
+    which is what makes the transitions safe against concurrent exec admission,
+    release, and a second suspend or resume. See `as_dormant_route_store`.
+    """
+
+    async def begin_suspend(self, sandbox_id: str, generation: int) -> bool: ...
+    async def finish_suspend(self, sandbox_id: str, generation: int) -> None: ...
+    async def abort_suspend(self, sandbox_id: str, generation: int) -> None: ...
+    async def begin_resume(
+        self,
+        route: Route,
+        worker: dict[str, Any],
+        *,
+        bump_generation: bool,
+        profile_hash: str,
+        created_by: str,
+    ) -> Route | None: ...
+    async def abort_resume(self, sandbox_id: str, generation: int) -> None: ...
+    async def list_dormant_routes_to_reclaim(
+        self,
+        *,
+        retention_seconds: int,
+        suspending_grace_seconds: int,
+        limit: int,
+    ) -> list[Route]: ...
+
+
+def as_dormant_route_store(store: object) -> DormantRouteStore | None:
+    """Narrow a metadata store to suspend/resume transitions, or report it cannot."""
+
+    if store is None:
+        return None
+    required = (
+        "begin_suspend",
+        "finish_suspend",
+        "abort_suspend",
+        "begin_resume",
+        "abort_resume",
+        "list_dormant_routes_to_reclaim",
+    )
+    if not all(callable(getattr(store, name, None)) for name in required):
+        return None
+    return cast("DormantRouteStore", store)
+
+
 class FleetQueries(Protocol):
     """Fleet-wide reads used by the admin console.
 
@@ -163,4 +213,11 @@ def create_metadata_store(settings: Settings) -> MetadataStore:
     return SqlAlchemyDatabase(settings)
 
 
-__all__ = ["FleetQueries", "MetadataStore", "as_fleet_queries", "create_metadata_store"]
+__all__ = [
+    "DormantRouteStore",
+    "FleetQueries",
+    "MetadataStore",
+    "as_dormant_route_store",
+    "as_fleet_queries",
+    "create_metadata_store",
+]

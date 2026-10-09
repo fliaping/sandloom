@@ -75,6 +75,15 @@ class Settings(BaseSettings):
     orphan_running_grace_seconds: int = 60
     orphan_reaper_batch_size: int = 100
     maintenance_interval_seconds: float = 60.0
+    # How long a suspended (dormant) sandbox keeps its workspace before the
+    # maintenance reaper releases it and reclaims the disk. 0 keeps it until a
+    # client releases it.
+    suspended_retention_seconds: int = Field(default=7 * 24 * 3600, ge=0)
+    # Whether a suspend also archives the workspace to the object store, so a
+    # resume can land on another worker: `auto` does so for local storage when a
+    # store is configured, `always` refuses to suspend without one, `never` keeps
+    # the dormant workspace on its worker only.
+    suspend_snapshot: str = "auto"
     disk_high_watermark_percent: int = 90
     min_free_bytes: int = 1024 * 1024 * 1024
 
@@ -250,6 +259,14 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in {"host", "isolated"}:
             raise ValueError("network_mode must be 'host' or 'isolated'")
+        return normalized
+
+    @field_validator("suspend_snapshot")
+    @classmethod
+    def validate_suspend_snapshot(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"auto", "always", "never"}:
+            raise ValueError("suspend_snapshot must be 'auto', 'always' or 'never'")
         return normalized
 
     @field_validator("isolation_required_features", "isolation_optional_features")

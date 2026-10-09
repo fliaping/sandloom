@@ -336,7 +336,7 @@ const bytes = (value) => {
 };
 const STATUS_TONE = {
   READY: "ok", ACTIVE: "ok", RUNNING: "run", ASSIGNED: "warn",
-  RELEASING: "warn", RELEASED: "off", SUCCEEDED: "ok",
+  RELEASING: "warn", RELEASED: "off", SUSPENDING: "warn", SUSPENDED: "off", SUCCEEDED: "ok",
   FAILED: "bad", TIMED_OUT: "bad", CANCELLED: "off", LOST: "bad", DRAINING: "warn",
 };
 const status = (value) => el("span", { class: "st " + (STATUS_TONE[value] || "") }, value || "—");
@@ -371,7 +371,7 @@ function overview(d) {
   const disk = d.disk || {};
   const rec = d.reclamation || {};
   const byStatus = d.sandboxes_by_status || {};
-  const order = ["READY", "RUNNING", "ASSIGNED", "RELEASING", "RELEASED"];
+  const order = ["READY", "RUNNING", "ASSIGNED", "SUSPENDED", "RELEASING", "RELEASED"];
   const seen = Object.keys(byStatus);
   const statuses = order.filter((k) => k in byStatus).concat(seen.filter((k) => !order.includes(k)));
   return [
@@ -481,7 +481,7 @@ function sandboxes(d) {
       }),
       el("select", {
         onchange: (e) => { S.filters.status = e.target.value; S.page.offset = 0; load(); },
-      }, ["", "READY", "RUNNING", "ASSIGNED", "RELEASING", "RELEASED"].map((v) =>
+      }, ["", "READY", "RUNNING", "ASSIGNED", "SUSPENDED", "RELEASING", "RELEASED"].map((v) =>
         el("option", { value: v, selected: S.filters.status === v }, v || "All statuses"))),
     ),
     rows.length

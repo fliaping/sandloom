@@ -77,6 +77,8 @@ async def test_http_mcp_uses_2026_07_28_and_exposes_sandbox_toolset(tmp_path: Pa
             "sandbox_cancel",
             "sandbox_write_file",
             "sandbox_read_file",
+            "sandbox_suspend",
+            "sandbox_resume",
             "sandbox_release",
         }
 

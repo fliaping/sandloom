@@ -32,8 +32,9 @@ flowchart LR
 - The execution backend creates short-lived isolated processes over a stable
   workspace.
 - The workspace is local or shared POSIX storage. The object store holds
-  environment templates and any checkpoint archives a caller puts there; the
-  service itself neither snapshots nor restores a workspace.
+  environment templates, any checkpoint archives a caller puts there, and the
+  snapshot of a suspended sandbox, which is the only workspace the service
+  itself archives and restores ([Suspend and resume](SUSPEND_RESUME.md)).
 
 ## Sandbox lifecycle
 
@@ -43,7 +44,10 @@ flowchart LR
 3. Every `exec` obtains a workspace lock, creates a fresh Bubblewrap process,
    and persists an idempotency record.
 4. The route moves through `ASSIGNED`, `READY`, `RUNNING`, `RELEASING`, and
-   `RELEASED` states using compare-and-set updates.
+   `RELEASED` states using compare-and-set updates. An idle `READY` route can
+   also be parked as `SUSPENDING`/`SUSPENDED`, which releases its capacity slot
+   and keeps its workspace until a resume; see
+   [Suspend and resume](SUSPEND_RESUME.md).
 5. Reassignment increments `generation`. Stale generations are rejected at
    both the control API and worker API.
 
@@ -67,6 +71,11 @@ sandbox is pinned rather than evicted:
   its execution record is marked `WORKER_LOST` with it. The generation advances,
   so the replacement worker — and any client still holding the old generation —
   cannot mistake the reclaimed sandbox for the one that was running.
+- **Suspended past retention.** A route suspended for longer than
+  `SANDBOX_SUSPENDED_RETENTION_SECONDS` (seven days by default) is released
+  with reason `SUSPEND_EXPIRED`, deleting its directory and snapshot. Under
+  disk pressure the same cycle first drops local copies of suspended sandboxes
+  that have a snapshot. See [Suspend and resume](SUSPEND_RESUME.md).
 
 A client that was waiting on the execution sees its connection to that worker
 drop. That is not recoverable at the point of failure: the guarantee is that
@@ -181,7 +190,8 @@ a rollback has to stay possible.
 - A shared POSIX workspace has one logical writer. An advisory filesystem lock
   protects the failover overlap window.
 - Local storage failover preserves the logical sandbox ID but not physical
-  files. Callers needing recovery must restore from a checkpoint.
+  files. Callers needing recovery must restore from a checkpoint; a suspended
+  sandbox with a snapshot is the exception, and resumes on another worker.
 
 ## Non-goals
 

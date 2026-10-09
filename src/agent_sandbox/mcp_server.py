@@ -16,7 +16,14 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings
 from .models import Route
-from .schemas import ExecRequest, ExecResponse, ResolveRequest, SandboxAuditResponse
+from .schemas import (
+    ExecRequest,
+    ExecResponse,
+    ResolveRequest,
+    ResumeResponse,
+    SandboxAuditResponse,
+    SuspendResponse,
+)
 from .service import SandboxService, route_audit
 from .storage import MetadataStore
 
@@ -128,7 +135,9 @@ def build_mcp_server(
         "agent-sandbox",
         instructions=(
             "Operate Sandboxes through the unified Control Plane. Always keep the generation "
-            "returned by sandbox_resolve and call sandbox_release in a finally step."
+            "returned by sandbox_resolve and call sandbox_release in a finally step. "
+            "While waiting on something slow, call sandbox_suspend to give the slot back "
+            "and sandbox_resume (or sandbox_resolve) to continue with the same workspace."
         ),
     )
 
@@ -359,6 +368,29 @@ def build_mcp_server(
             timeout_seconds=60.0,
         )
         return FileContent.model_validate(_worker_payload(response))
+
+    @mcp.tool(
+        name="sandbox_suspend",
+        description=(
+            "Release the Sandbox capacity slot and keep its workspace until resumed. "
+            "Refused while a command runs; repeating it is a no-op. Running processes "
+            "are not preserved."
+        ),
+        annotations=IDEMPOTENT_WRITE,
+    )
+    async def sandbox_suspend(sandbox_id: str, generation: int) -> SuspendResponse:
+        return await service.suspend(sandbox_id, generation)
+
+    @mcp.tool(
+        name="sandbox_resume",
+        description=(
+            "Wake a suspended Sandbox with its workspace and return the route to use; "
+            "a no-op when it is awake. Use the returned generation from then on."
+        ),
+        annotations=IDEMPOTENT_WRITE,
+    )
+    async def sandbox_resume(sandbox_id: str) -> ResumeResponse:
+        return await service.resume(sandbox_id)
 
     @mcp.tool(
         name="sandbox_release",

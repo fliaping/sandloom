@@ -108,6 +108,23 @@ ROUTES: list[tuple[str, str, dict[str, Any]]] = [
         {"json": {"generation": 2, "templates": ["env-a"]}},
     ),
     (
+        "POST",
+        "/internal/v1/sandboxes/sb-1/suspend",
+        {"json": {"generation": 2}},
+    ),
+    (
+        "POST",
+        "/internal/v1/sandboxes/sb-1/resume",
+        {
+            "json": {
+                "generation": 2,
+                "sandbox_uid": 20001,
+                "profile": "coding-default",
+                "worker_epoch": "epoch-1",
+            }
+        },
+    ),
+    (
         "DELETE",
         "/internal/v1/sandboxes/sb-1",
         {"params": {"generation": 2}},

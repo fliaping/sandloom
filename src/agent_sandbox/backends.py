@@ -85,6 +85,35 @@ def as_directory_operations(backend: object) -> DirectoryOperations | None:
     return cast("DirectoryOperations", backend)
 
 
+class DormantLifecycle(Protocol):
+    """Suspending a sandbox to release its slot, and resuming it later.
+
+    Optional for the same reason `DirectoryOperations` is: a backend from an
+    earlier release keeps loading, and the API answers 501 for it instead.
+    Narrow with `as_dormant_lifecycle()`.
+    """
+
+    dormant: dict[str, Any]
+
+    async def suspend(
+        self, sandbox_id: str, generation: int, *, snapshot: bool = False
+    ) -> dict[str, object]: ...
+    async def resume(
+        self, sandbox_id: str, generation: int, uid: int, *, restore: str = "reuse"
+    ) -> tuple[LocalSandbox, str]: ...
+    async def reclaim_dormant_disk(self) -> list[str]: ...
+
+
+def as_dormant_lifecycle(backend: object) -> DormantLifecycle | None:
+    """Narrow a backend to suspend/resume, or report that it cannot."""
+    if backend is None:
+        return None
+    required = ("suspend", "resume", "reclaim_dormant_disk")
+    if not all(callable(getattr(backend, name, None)) for name in required):
+        return None
+    return cast("DormantLifecycle", backend)
+
+
 def create_execution_backend(settings: Settings) -> ExecutionBackend:
     """Load the explicitly configured backend.
 
@@ -103,9 +132,11 @@ def create_execution_backend(settings: Settings) -> ExecutionBackend:
 
 __all__ = [
     "DirectoryOperations",
+    "DormantLifecycle",
     "ExecutionBackend",
     "TemplateCachePruning",
     "as_directory_operations",
+    "as_dormant_lifecycle",
     "as_template_cache_pruning",
     "create_execution_backend",
 ]

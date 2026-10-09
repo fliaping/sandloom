@@ -6,23 +6,27 @@ import asyncio
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
 import httpx
 
 from .backends import (
+    DormantLifecycle,
     ExecutionBackend,
+    as_dormant_lifecycle,
     as_template_cache_pruning,
     create_execution_backend,
 )
 from .config import Settings
 from .credentials import CredentialBroker, create_credential_broker
+from .dormant import delete_snapshot, read_manifest
 from .models import (
     AUDIT_HISTORY_MAX_BYTES,
     AUDIT_HISTORY_MAX_ENTRIES,
     AUDIT_HISTORY_RETENTION_DAYS,
     Route,
+    as_utc,
 )
 from .observability import error_code
 from .preflight import (
@@ -37,12 +41,19 @@ from .schemas import (
     ExecResponse,
     LifecycleAuditEntry,
     ResolveRequest,
+    ResumeResponse,
     RouteResponse,
     SandboxAuditResponse,
+    SuspendResponse,
     TemplateAttachRequest,
     TemplateBuildRequest,
 )
-from .storage import MetadataStore, as_exec_history_pruning
+from .storage import (
+    DormantRouteStore,
+    MetadataStore,
+    as_dormant_route_store,
+    as_exec_history_pruning,
+)
 from .templates import (
     TemplateCatalog,
     TemplateRecord,
@@ -65,7 +76,11 @@ ReleaseReason = Literal[
     "PROFILE_UPGRADE",
     "WORKER_REASSIGNED",
     "RELEASE_RETRY",
+    "SUSPEND_EXPIRED",
 ]
+# A suspended route is parked: no exec, file call, or proxy reaches it until a
+# resume, which is the only way back to ASSIGNED/READY.
+DORMANT_STATUSES = frozenset({"SUSPENDING", "SUSPENDED"})
 
 
 def workspace_actor(route: Route) -> str:
@@ -322,6 +337,7 @@ class SandboxService:
                     cast(int, self.reaper_status["failures_total"]) + 1
                 )
                 logger.exception("failed to reclaim orphaned sandbox: %s", route.sandbox_id)
+        released += await self._reclaim_dormant()
         self.reaper_status.update(
             {
                 "last_run_at": datetime.now(UTC).isoformat(),
@@ -373,7 +389,12 @@ class SandboxService:
         return time.monotonic() - self.last_heartbeat_at < self.settings.heartbeat_ttl_seconds
 
     async def validate_local_route(
-        self, sandbox_id: str, generation: int, *, allow_releasing: bool = False
+        self,
+        sandbox_id: str,
+        generation: int,
+        *,
+        allow_releasing: bool = False,
+        allow_dormant: bool = False,
     ) -> Route:
         route = await self.database.find_route(sandbox_id)
         invalid_statuses = {"RELEASED"} if allow_releasing else {"RELEASED", "RELEASING"}
@@ -385,6 +406,8 @@ class SandboxService:
             or route.status in invalid_statuses
         ):
             raise RuntimeError("STALE_SANDBOX_ROUTE")
+        if route.status in DORMANT_STATUSES and not allow_dormant:
+            raise RuntimeError("SANDBOX_SUSPENDED")
         return route
 
     async def proxy_to_worker(
@@ -411,6 +434,9 @@ class SandboxService:
             or route.status in {"RELEASED", "RELEASING"}
         ):
             raise RuntimeError("STALE_SANDBOX_ROUTE")
+        if route.status in DORMANT_STATUSES:
+            # Answered here, so a suspended sandbox costs its worker nothing.
+            raise RuntimeError("SANDBOX_SUSPENDED")
         worker = await self.registry.get(route.worker_id)
         if (
             not worker
@@ -463,6 +489,12 @@ class SandboxService:
             raise RuntimeError("SANDBOX_SCOPE_MISMATCH")
         if route.profile_id != request.profile:
             raise RuntimeError("SANDBOX_PROFILE_MISMATCH")
+        if route.status in DORMANT_STATUSES:
+            # Resolving is how an agent comes back, so it wakes the sandbox
+            # rather than reassigning it, which would discard the workspace.
+            return await self.resume(
+                request.sandbox_id, created_by=f"workspace:{request.workspace_scope_id}"
+            )
         if route.profile_hash != self.settings.profile_hash:
             # profile_hash is only a runtime capability fingerprint, so an old route
             # necessarily lags after an upgrade. Rebuild the route (new worker, bumped
@@ -691,6 +723,354 @@ class SandboxService:
             reason=reason,
             released_by=released_by,
         )
+        if route.status in DORMANT_STATUSES:
+            await self._delete_dormant_snapshot(route.sandbox_id)
+
+    # ── suspend and resume ──
+    #
+    # A suspended sandbox keeps its workspace and gives back its capacity slot.
+    # Nothing is frozen: suspend is refused while a command runs, and a resume
+    # starts with no processes. See docs/SUSPEND_RESUME.md.
+
+    def _dormant_store(self) -> DormantRouteStore:
+        store = as_dormant_route_store(self.database)
+        if store is None:
+            raise RuntimeError("SANDBOX_SUSPEND_UNSUPPORTED")
+        return store
+
+    def dormant_runtime(self) -> DormantLifecycle:
+        runtime = as_dormant_lifecycle(self.runtime)
+        if runtime is None:
+            raise RuntimeError("SANDBOX_SUSPEND_UNSUPPORTED")
+        return runtime
+
+    def snapshot_on_suspend(self, route: Route) -> bool:
+        """Whether a suspend of this route also archives it to the object store."""
+        mode = self.settings.suspend_snapshot
+        if route.storage_mode == "shared" or mode == "never":
+            # A shared workspace is reachable from every worker already.
+            return False
+        has_store = self.template_catalog.object_store is not None
+        if mode == "always" and not has_store:
+            raise RuntimeError("SANDBOX_SNAPSHOT_UNAVAILABLE")
+        return has_store
+
+    def _retained_until(self, route: Route) -> datetime | None:
+        retention = self.settings.suspended_retention_seconds
+        if retention <= 0:
+            return None
+        start = route.last_active_at or datetime.now(UTC)
+        return as_utc(start) + timedelta(seconds=retention)
+
+    async def suspend(
+        self, sandbox_id: str, generation: int, *, actor: str | None = None
+    ) -> SuspendResponse:
+        """Release the sandbox's slot, keep its workspace. Idempotent.
+
+        The route is claimed (READY -> SUSPENDING) by a conditional update on
+        the same row exec admission locks, so a suspend and an exec cannot both
+        win: a running command makes this answer `SANDBOX_SUSPEND_BUSY`, and an
+        exec after the claim answers `SANDBOX_SUSPENDED`. Other sandboxes, and
+        other scopes, are never touched.
+        """
+        store = self._dormant_store()
+        route = await self.database.find_route(sandbox_id)
+        if route is None:
+            raise RuntimeError("SANDBOX_NOT_FOUND")
+        if route.generation != generation:
+            raise RuntimeError("STALE_SANDBOX_GENERATION")
+        if not await store.begin_suspend(sandbox_id, generation):
+            return self._suspend_response(route, suspended=False)
+        snapshot = await self._finish_suspend(route)
+        current = await self.database.find_route(sandbox_id)
+        logger.info(
+            "suspended sandbox: sandbox_id=%s generation=%s snapshot=%s actor=%s",
+            sandbox_id,
+            generation,
+            snapshot,
+            actor or workspace_actor(route),
+        )
+        return self._suspend_response(current or route, snapshot=snapshot)
+
+    def _suspend_response(
+        self, route: Route, *, suspended: bool = True, snapshot: bool | None = None
+    ) -> SuspendResponse:
+        return SuspendResponse(
+            sandbox_id=route.sandbox_id,
+            generation=route.generation,
+            status=route.status,
+            snapshot=bool(snapshot),
+            suspended=suspended,
+            retained_until=self._retained_until(route),
+        )
+
+    async def _finish_suspend(self, route: Route) -> bool:
+        """Have the owning worker release the slot, then park the route."""
+        store = self._dormant_store()
+        worker = await self.registry.get(route.worker_id)
+        snapshot = False
+        if worker and worker.get("worker_epoch") == route.worker_epoch:
+            try:
+                payload = await self._call_worker(
+                    worker,
+                    "POST",
+                    f"/internal/v1/sandboxes/{route.sandbox_id}/suspend",
+                    generation=route.generation,
+                    json_body={"generation": route.generation},
+                    # A snapshot archives and uploads the workspace.
+                    timeout_seconds=self.settings.template_snapshot_timeout_seconds + 60,
+                )
+            except RuntimeError as exc:
+                if str(exc) != "SANDBOX_WORKER_UNREACHABLE":
+                    # The worker refused (busy, snapshot failed): nothing was
+                    # released, so the sandbox goes back to READY untouched.
+                    await store.abort_suspend(route.sandbox_id, route.generation)
+                # Unreachable stays SUSPENDING; a retry or the reaper finishes it.
+                raise
+            snapshot = bool(payload.get("snapshot"))
+        # A worker that is gone holds no slot and runs nothing, so there is
+        # nothing to release; resume decides where the workspace comes from.
+        await store.finish_suspend(route.sandbox_id, route.generation)
+        return snapshot
+
+    async def resume(self, sandbox_id: str, *, created_by: str | None = None) -> ResumeResponse:
+        """Wake a suspended sandbox; a no-op for one that is awake.
+
+        Prefers the worker that kept the directory. Otherwise a shared
+        workspace moves to any worker, and a local one moves only if the object
+        store holds its snapshot. Moving bumps the generation.
+        """
+        store = self._dormant_store()
+        for _ in range(3):
+            route = await self.database.find_route(sandbox_id)
+            if route is None:
+                raise RuntimeError("SANDBOX_NOT_FOUND")
+            if route.status in {"RELEASED", "RELEASING"}:
+                raise RuntimeError("STALE_SANDBOX_ROUTE")
+            if route.status == "SUSPENDING":
+                raise RuntimeError("SANDBOX_SUSPEND_IN_PROGRESS")
+            if route.status != "SUSPENDED":
+                return await self._awake_response(route)
+            actor = created_by or workspace_actor(route)
+            worker, bump, restore = await self._resume_plan(route)
+            claimed = await store.begin_resume(
+                route,
+                worker,
+                bump_generation=bump,
+                profile_hash=self.settings.profile_hash,
+                created_by=actor,
+            )
+            if claimed is None:
+                # Another resume, or a release, got there first; look again.
+                continue
+            try:
+                payload = await self._call_worker(
+                    worker,
+                    "POST",
+                    f"/internal/v1/sandboxes/{sandbox_id}/resume",
+                    generation=claimed.generation,
+                    json_body={
+                        "generation": claimed.generation,
+                        "sandbox_uid": claimed.sandbox_uid,
+                        "profile": claimed.profile_id,
+                        "worker_epoch": claimed.worker_epoch,
+                        "restore": restore,
+                    },
+                    timeout_seconds=self.settings.template_snapshot_timeout_seconds + 60,
+                )
+            except BaseException:
+                # Back to sleep, where a retry finds it. The workspace was not
+                # touched, or a failed restore was staged and thrown away.
+                await store.abort_resume(sandbox_id, claimed.generation)
+                raise
+            source = str(payload.get("workspace_source") or "reused")
+            current = await self.database.find_route(sandbox_id) or claimed
+            logger.info(
+                "resumed sandbox: sandbox_id=%s generation=%s worker_id=%s source=%s",
+                sandbox_id,
+                current.generation,
+                current.worker_id,
+                source,
+            )
+            return ResumeResponse(
+                **self.route_response(current, worker).model_dump(),
+                resumed=True,
+                workspace_source=cast("Literal['active', 'reused', 'restored']", source),
+            )
+        raise RuntimeError("SANDBOX_BUSY_OR_STALE")
+
+    async def _awake_response(self, route: Route) -> ResumeResponse:
+        worker = await self.registry.get(route.worker_id)
+        if not worker or worker.get("worker_epoch") != route.worker_epoch:
+            # Awake but orphaned: the same recovery resolve performs.
+            resolved = await self.resolve(
+                ResolveRequest(
+                    sandbox_id=route.sandbox_id,
+                    workspace_scope_id=route.workspace_scope_id,
+                    profile=route.profile_id,
+                )
+            )
+            return ResumeResponse(
+                **resolved.model_dump(exclude={"resumed", "workspace_source"}),
+                resumed=False,
+                workspace_source="active",
+            )
+        return ResumeResponse(
+            **self.route_response(route, worker).model_dump(),
+            resumed=False,
+            workspace_source="active",
+        )
+
+    async def _resume_plan(self, route: Route) -> tuple[dict[str, Any], bool, str]:
+        """Pick (worker, bump_generation, restore) for a suspended route."""
+        profile_hash = self.settings.profile_hash
+        original = await self.registry.get(route.worker_id)
+        if (
+            original
+            and original.get("worker_id") == route.worker_id
+            and original.get("status") == "ACTIVE"
+            and original.get("profile_hash") == profile_hash
+            and int(original.get("running_sessions", 0)) < int(original.get("capacity", 0))
+        ):
+            # Same worker: its directory is reused. Only a restarted worker (new
+            # epoch) or a new profile needs a new generation.
+            bump = (
+                original.get("worker_epoch") != route.worker_epoch
+                or route.profile_hash != profile_hash
+            )
+            return original, bump, "reuse"
+        if route.storage_mode == "shared":
+            return await self.registry.select(profile_hash=profile_hash), True, "reuse"
+        if await self._dormant_snapshot_exists(route.sandbox_id):
+            candidate = await self.registry.select(
+                profile_hash=profile_hash,
+                exclude={route.worker_id} if route.worker_id else None,
+            )
+            return candidate, True, "snapshot"
+        if original:
+            # Its worker is alive but full or draining: the slot comes back.
+            raise RuntimeError("NO_SANDBOX_WORKER_AVAILABLE")
+        # The only copy is on a worker that is not running. It may return;
+        # until then, or until retention expires, there is nothing to resume.
+        raise RuntimeError("SANDBOX_DORMANT_WORKSPACE_UNAVAILABLE")
+
+    async def _dormant_snapshot_exists(self, sandbox_id: str) -> bool:
+        object_store = self.template_catalog.object_store
+        if object_store is None:
+            return False
+        manifest = await asyncio.to_thread(read_manifest, object_store, sandbox_id)
+        return manifest is not None
+
+    async def _delete_dormant_snapshot(self, sandbox_id: str) -> None:
+        object_store = self.template_catalog.object_store
+        if object_store is None:
+            return
+        try:
+            await asyncio.to_thread(delete_snapshot, object_store, sandbox_id)
+        except Exception:
+            logger.warning(
+                "could not delete a dormant snapshot: sandbox_id=%s", sandbox_id, exc_info=True
+            )
+
+    async def delete_dormant_snapshot(self, sandbox_id: str) -> None:
+        """Best-effort: a resumed sandbox's snapshot is stale the moment it runs."""
+        await self._delete_dormant_snapshot(sandbox_id)
+
+    async def _reclaim_dormant(self) -> int:
+        """Retention expiry and disk pressure, for suspended sandboxes.
+
+        Expired suspended routes are released, which deletes the directory on
+        their worker and the snapshot in the object store. Stalled suspends are
+        finished. Under disk pressure this worker also drops local copies of
+        dormant sandboxes whose snapshot exists; they stay suspended and resume
+        from the snapshot.
+        """
+        released = 0
+        runtime = as_dormant_lifecycle(self.runtime)
+        if runtime is not None:
+            try:
+                evicted = await runtime.reclaim_dormant_disk()
+                if evicted:
+                    self.reaper_status["dormant_evicted_total"] = cast(
+                        int, self.reaper_status.get("dormant_evicted_total", 0)
+                    ) + len(evicted)
+            except Exception:
+                logger.exception("dormant disk reclamation failed; retrying next cycle")
+        store = as_dormant_route_store(self.database)
+        if store is None:
+            return released
+        routes = await store.list_dormant_routes_to_reclaim(
+            retention_seconds=self.settings.suspended_retention_seconds,
+            suspending_grace_seconds=self.settings.orphan_release_grace_seconds,
+            limit=self.settings.orphan_reaper_batch_size,
+        )
+        for route in routes:
+            try:
+                if route.status == "SUSPENDING":
+                    await self._finish_suspend(route)
+                    continue
+                await self.release(route, reason="SUSPEND_EXPIRED", released_by=SYSTEM_REAPER_ACTOR)
+                released += 1
+                logger.info(
+                    "released expired suspended sandbox: sandbox_id=%s generation=%s",
+                    route.sandbox_id,
+                    route.generation,
+                )
+            except Exception as exc:
+                if error_code(exc) in _ROUTE_GONE_CODES:
+                    continue
+                self.reaper_status["failures_total"] = (
+                    cast(int, self.reaper_status["failures_total"]) + 1
+                )
+                logger.exception("failed to reclaim suspended sandbox: %s", route.sandbox_id)
+        return released
+
+    async def refresh_capacity(self) -> None:
+        """Publish a heartbeat now, so a released or retaken slot is visible at once."""
+        try:
+            await self._heartbeat()
+        except Exception:
+            logger.warning("capacity heartbeat failed; the next cycle publishes it")
+
+    async def _call_worker(
+        self,
+        worker: dict[str, Any],
+        method: str,
+        path: str,
+        *,
+        generation: int,
+        json_body: dict[str, Any] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {self.settings.internal_token}",
+            "X-Sandbox-Worker-ID": str(worker["worker_id"]),
+            "X-Sandbox-Generation": str(generation),
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout_seconds, connect=10.0), headers=headers
+            ) as client:
+                response = await client.request(
+                    method, f"{str(worker['endpoint']).rstrip('/')}{path}", json=json_body
+                )
+        except httpx.RequestError as exc:
+            raise RuntimeError("SANDBOX_WORKER_UNREACHABLE") from exc
+        if not response.is_success:
+            raise RuntimeError(_worker_error_code(response))
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
+
+def _worker_error_code(response: httpx.Response) -> str:
+    """The code a worker refused with: plain text, or FastAPI's `detail`."""
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("detail"), str):
+        return str(data["detail"])
+    return response.text.strip() or f"SANDBOX_WORKER_HTTP_{response.status_code}"
 
 
 def _exec_from_row(row: dict[str, Any]) -> ExecResponse:

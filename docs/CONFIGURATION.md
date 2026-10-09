@@ -82,6 +82,8 @@ profile identity.
 | `SANDBOX_UID_START` | `20000` | First uid handed to a sandbox. |
 | `SANDBOX_UID_END` | `59999` | Last one. Must be at least `SANDBOX_UID_START`, which must be at least 1. |
 | `SANDBOX_IDLE_TTL_SECONDS` | `1800` | A sandbox with no activity for this long is reclaimed. |
+| `SANDBOX_SUSPENDED_RETENTION_SECONDS` | `604800` (7 days) | A suspended sandbox is kept this long, then released with reason `SUSPEND_EXPIRED` and its directory and snapshot deleted. `0` keeps it until a client releases it. Suspended sandboxes are not subject to the idle TTL. See [Suspend and resume](SUSPEND_RESUME.md). |
+| `SANDBOX_SUSPEND_SNAPSHOT` | `auto` | Whether a suspend archives `/workspace`, `/home` and `/envs` to the object store so a resume can land on another worker: `auto` (local storage with a store configured), `always` (refuse to suspend without a store), or `never`. |
 | `SANDBOX_WORKER_CAPACITY` | `32` | Sandboxes this worker admits. Placement prefers the worker with the fewest running sessions relative to its capacity, from the last heartbeat. |
 | `SANDBOX_HEARTBEAT_INTERVAL_SECONDS` | `10.0` | How often a worker re-registers itself. |
 | `SANDBOX_HEARTBEAT_TTL_SECONDS` | `30` | A registration older than this is stale. It must exceed twice the interval, or a single missed heartbeat would look like a dead worker. |

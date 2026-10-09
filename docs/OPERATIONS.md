@@ -51,7 +51,9 @@ worker; it does not promise every in-flight command completes.
 
 Sandbox routes are sticky. Local-only workspace data is not automatically
 recovered onto another worker. Shared RWX POSIX storage must preserve UID
-ownership; S3 checkpoints require caller-driven restore orchestration.
+ownership; S3 checkpoints require caller-driven restore orchestration. The
+exception is a suspended sandbox whose suspend uploaded a snapshot: resuming it
+restores the workspace on another worker ([Suspend and resume](SUSPEND_RESUME.md)).
 Client requests must carry the current generation so stale owners are refused.
 
 ## Backups and recovery

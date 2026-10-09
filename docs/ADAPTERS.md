@@ -23,8 +23,13 @@ chain. Object storage holds archives rather than filesystem calls: environment
 templates, and checkpoint archives a caller keeps. `BlobStore.upload_checkpoint(sandbox_id, archive)`
 names one at `checkpoints/<sandbox_id>/<archive name>` and returns the URI that
 `get`/`download_to`/`delete` address it by, which is the whole of what this
-project does about checkpoints — it does not snapshot or restore a workspace for
-you. See [Architecture](ARCHITECTURE.md).
+project does about caller checkpoints — it does not snapshot or restore a running
+workspace for you. Suspend is the one exception: it archives a dormant workspace
+under `checkpoints/<sandbox_id>/dormant/` so a resume can land on another worker
+([Suspend and resume](SUSPEND_RESUME.md)). A metadata store opts in to suspend by
+implementing `DormantRouteStore`, and an execution backend by implementing
+`DormantLifecycle`; without them the API answers 501
+`SANDBOX_SUSPEND_UNSUPPORTED`. See [Architecture](ARCHITECTURE.md).
 
 ## Plugin discovery
 
