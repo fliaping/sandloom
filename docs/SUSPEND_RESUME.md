@@ -45,6 +45,7 @@ are values of the existing route status.
 | resume | `SUSPENDED` | `READY`, `"resumed": true` |
 | resume | `ASSIGNED`/`READY`/`RUNNING` | 200 with `"resumed": false`; nothing changes |
 | resume | `SUSPENDING` | 409 `SANDBOX_SUSPEND_IN_PROGRESS`; retry |
+| resume | `RELEASED` (e.g. retention expired) | 409 `STALE_SANDBOX_ROUTE`; `resolve` starts a new, empty sandbox |
 | exec, file call, connect | `SUSPENDING`/`SUSPENDED` | 409 `SANDBOX_SUSPENDED` |
 | release | `SUSPENDED` | released, directory and snapshot deleted |
 
@@ -142,6 +143,9 @@ resumes or is released.
 - Disk eviction is tracked in the worker's memory. A worker that restarts
   forgets which dormant copies it evicted; their resume still restores from the
   snapshot because the directory is missing.
+- A sandbox that resumed on another worker from its snapshot leaves its old
+  directory on the original worker. Nothing deletes that stale copy when the
+  original worker comes back; budget its disk or clean it out of band.
 - With local storage and no snapshot, a worker that never comes back takes the
   dormant workspace with it, exactly as it would take a running one. Retention
   eventually releases the route.
