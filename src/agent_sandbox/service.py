@@ -338,7 +338,9 @@ class SandboxService:
                     cast(int, self.reaper_status["failures_total"]) + 1
                 )
                 logger.exception("failed to reclaim orphaned sandbox: %s", route.sandbox_id)
-        released += await self._reclaim_dormant()
+        dormant_released, dormant_gone = await self._reclaim_dormant()
+        released += dormant_released
+        gone_already += dormant_gone
         await self._reclaim_orphan_workspaces()
         self.reaper_status.update(
             {
@@ -725,7 +727,10 @@ class SandboxService:
             reason=reason,
             released_by=released_by,
         )
-        if route.status in DORMANT_STATUSES:
+        if route.status in DORMANT_STATUSES or route.status == "RELEASING":
+            # A RELEASING route may be the retry of a suspended one whose first
+            # attempt failed, and its snapshot is only deleted here. Deleting
+            # is a no-op when no manifest exists.
             await self._delete_dormant_snapshot(route.sandbox_id)
 
     # ── suspend and resume ──
@@ -978,7 +983,7 @@ class SandboxService:
         """Best-effort: a resumed sandbox's snapshot is stale the moment it runs."""
         await self._delete_dormant_snapshot(sandbox_id)
 
-    async def _reclaim_dormant(self) -> int:
+    async def _reclaim_dormant(self) -> tuple[int, int]:
         """Retention expiry and disk pressure, for suspended sandboxes.
 
         Expired suspended routes are released, which deletes the directory on
@@ -988,6 +993,7 @@ class SandboxService:
         from the snapshot.
         """
         released = 0
+        gone_already = 0
         runtime = as_dormant_lifecycle(self.runtime)
         if runtime is not None:
             try:
@@ -1000,7 +1006,7 @@ class SandboxService:
                 logger.exception("dormant disk reclamation failed; retrying next cycle")
         store = as_dormant_route_store(self.database)
         if store is None:
-            return released
+            return released, gone_already
         routes = await store.list_dormant_routes_to_reclaim(
             retention_seconds=self.settings.suspended_retention_seconds,
             suspending_grace_seconds=self.settings.orphan_release_grace_seconds,
@@ -1020,12 +1026,15 @@ class SandboxService:
                 )
             except Exception as exc:
                 if error_code(exc) in _ROUTE_GONE_CODES:
+                    # Counted like the idle sweep counts it: a client released
+                    # or resumed it between the listing and this call.
+                    gone_already += 1
                     continue
                 self.reaper_status["failures_total"] = (
                     cast(int, self.reaper_status["failures_total"]) + 1
                 )
                 logger.exception("failed to reclaim suspended sandbox: %s", route.sandbox_id)
-        return released
+        return released, gone_already
 
     async def _reclaim_orphan_workspaces(self) -> int:
         """Delete local workspace directories this worker no longer owns.

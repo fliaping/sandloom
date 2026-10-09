@@ -123,6 +123,20 @@ resumes or is released.
   snapshot. `0` keeps suspended sandboxes until a client releases them.
   Suspended sandboxes are not subject to `SANDBOX_IDLE_TTL_SECONDS`, and
   nothing a suspended sandbox refuses resets the clock.
+
+  An agent that never comes back therefore does not hold anything forever:
+  the expiry is an ordinary release, the same path an idle timeout or a
+  client release takes. The route is claimed (`RELEASING`), the owning worker
+  deletes the workspace directory, the route is marked `RELEASED` with an
+  audit entry (`release_reason: SUSPEND_EXPIRED`,
+  `released_by: system:orphan-reaper`, visible in
+  `GET /api/v1/sandboxes/{id}/audit`), and the snapshot is deleted. It is
+  counted in the reaper's `released_total` like any other reclamation. If the
+  worker cannot be reached, the route stays `RELEASING` and the reaper's
+  normal retry (`RELEASE_RETRY`) finishes it, snapshot included; a worker
+  that never comes back leaves its copy to the orphaned-directory cleanup
+  below. After expiry, `resume` answers 409 `STALE_SANDBOX_ROUTE`, and
+  `resolve` starts a new, empty sandbox under the same id.
 - **Disk pressure.** When the disk is over `SANDBOX_DISK_HIGH_WATERMARK_PERCENT`
   or under `SANDBOX_MIN_FREE_BYTES`, the maintenance cycle deletes the local
   copies of dormant sandboxes that have a snapshot, oldest first, until the

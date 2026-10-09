@@ -901,6 +901,9 @@ async def test_retention_expiry_releases_and_reclaims_the_disk(fleet: Any) -> No
     assert not root.exists()
     assert "agent-1" not in service.runtime.dormant
     assert store.keys() == []
+    # Counted by the same reaper counters as an idle-timeout release.
+    assert service.reaper_status["last_released"] == 1
+    assert service.reaper_status["released_total"] == 1
 
 
 # ── workspace directories left behind on a worker that no longer owns them ──
@@ -1032,3 +1035,50 @@ async def test_a_ttl_of_zero_keeps_orphaned_directories(fleet: Any) -> None:
     service.runtime.local_workspace_ids = None  # would fail if it were consulted
 
     assert await service._reclaim_orphan_workspaces() == 0
+
+
+async def test_an_expiry_that_fails_midway_is_finished_by_the_normal_retry(fleet: Any) -> None:
+    """Same release path as an idle timeout: claim, worker delete, audit, retry.
+
+    The first attempt cannot reach the worker and leaves the route RELEASING;
+    the reaper's ordinary RELEASE_RETRY finishes it, and that retry has to
+    delete the snapshot too, or it is left in the object store for good.
+    """
+    transport, store, (app,) = fleet
+    service = app.state.sandbox_service
+    generation = await _ready_sandbox(app)
+    await _api(app, "POST", "/api/v1/sandboxes/agent-1/suspend", json={"generation": generation})
+    root = service.settings.workspace_root / "agent-1"
+    assert root.exists() and store.keys()
+    async with service.database._engine().begin() as connection:
+        await connection.execute(
+            update(route_table)
+            .where(route_table.c.sandbox_id == "agent-1")
+            .values(
+                last_active_at=utc_now_naive()
+                - timedelta(seconds=service.settings.suspended_retention_seconds + 60)
+            )
+        )
+    worker_app = transport.apps.pop("worker-a")
+
+    await service._maintenance()
+
+    route = await service.database.find_route("agent-1")
+    assert route is not None and route.status == "RELEASING"
+    assert service.reaper_status["failures_total"] == 1
+    assert root.exists() and store.keys()
+
+    transport.apps["worker-a"] = worker_app
+    service.settings.orphan_release_grace_seconds = 0
+    await service._maintenance()
+
+    route = await service.database.find_route("agent-1")
+    assert route is not None
+    assert (route.status, route.last_release_reason, route.last_released_by) == (
+        "RELEASED",
+        "RELEASE_RETRY",
+        "system:orphan-reaper",
+    )
+    assert not root.exists()
+    assert store.keys() == []
+    assert service.reaper_status["released_total"] == 1
