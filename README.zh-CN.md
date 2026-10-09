@@ -321,7 +321,7 @@ POST /api/v1/sandboxes/my-agent/suspend   {"generation":3}
 POST /api/v1/sandboxes/my-agent/resume
 ```
 
-挂起与 exec 准入在同一行路由记录上原子判定：有命令在运行时挂起会被拒绝（`409 SANDBOX_SUSPEND_BUSY`），已挂起的沙箱会拒绝命令（`409 SANDBOX_SUSPENDED`），不会影响其他沙箱或其他 scope。恢复时优先在原 Worker 上复用目录；否则通过共享工作空间或对象存储快照迁移到其他 Worker。挂起的沙箱在 `SANDBOX_SUSPENDED_RETENTION_SECONDS`（默认七天）后被释放。不冻结进程，也不恢复内存。状态机、快照和磁盘回收见[挂起与恢复](docs/SUSPEND_RESUME.md)。
+挂起与 exec 准入在同一行路由记录上原子判定：有命令在运行时挂起会被拒绝（`409 SANDBOX_SUSPEND_BUSY`），已挂起的沙箱会拒绝命令（`409 SANDBOX_SUSPENDED`），不会影响其他沙箱或其他 scope。恢复时优先在原 Worker 上复用目录；否则通过共享工作空间或对象存储快照迁移到其他 Worker。挂起的沙箱在 `SANDBOX_SUSPENDED_RETENTION_SECONDS`（默认 30 天）后被释放。不冻结进程，也不恢复内存。状态机、快照和磁盘回收见[挂起与恢复](docs/SUSPEND_RESUME.md)。
 
 ## 环境模板
 

@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     # How long a suspended (dormant) sandbox keeps its workspace before the
     # maintenance reaper releases it and reclaims the disk. 0 keeps it until a
     # client releases it.
-    suspended_retention_seconds: int = Field(default=7 * 24 * 3600, ge=0)
+    suspended_retention_seconds: int = Field(default=30 * 24 * 3600, ge=0)
     # Whether a suspend also archives the workspace to the object store, so a
     # resume can land on another worker: `auto` does so for local storage when a
     # store is configured, `always` refuses to suspend without one, `never` keeps

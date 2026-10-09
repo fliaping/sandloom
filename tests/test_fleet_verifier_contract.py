@@ -75,7 +75,7 @@ async def test_health_reports_the_periods_this_deployment_runs_with(tmp_path: Pa
         "idle_ttl_seconds": 45,
         "orphan_running_grace_seconds": 7,
         "orphan_release_grace_seconds": 10,
-        "suspended_retention_seconds": 604800,
+        "suspended_retention_seconds": 2592000,
         "orphan_dormant_dir_ttl_seconds": 86400,
     }
 
@@ -130,7 +130,7 @@ def _periods(**overrides: Any) -> dict[str, float]:
         "heartbeat_ttl_seconds": 10,
         "idle_ttl_seconds": 45,
         "orphan_release_grace_seconds": 10,
-        "suspended_retention_seconds": 604800,
+        "suspended_retention_seconds": 2592000,
         "orphan_dormant_dir_ttl_seconds": 86400,
     }
     values.update(overrides)

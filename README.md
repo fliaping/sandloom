@@ -503,7 +503,7 @@ refuses commands (`409 SANDBOX_SUSPENDED`); other sandboxes and scopes are never
 touched. Resume reuses the directory on the original worker when it can, and
 otherwise moves the sandbox to another worker from a shared workspace or an
 object-store snapshot. Suspended sandboxes are released after
-`SANDBOX_SUSPENDED_RETENTION_SECONDS` (seven days by default). No process is
+`SANDBOX_SUSPENDED_RETENTION_SECONDS` (30 days by default). No process is
 frozen and no memory is restored. See [Suspend and resume](docs/SUSPEND_RESUME.md)
 for the state machine, snapshots, and disk reclamation.
 

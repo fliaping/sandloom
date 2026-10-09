@@ -72,7 +72,7 @@ sandbox is pinned rather than evicted:
   so the replacement worker — and any client still holding the old generation —
   cannot mistake the reclaimed sandbox for the one that was running.
 - **Suspended past retention.** A route suspended for longer than
-  `SANDBOX_SUSPENDED_RETENTION_SECONDS` (seven days by default) is released
+  `SANDBOX_SUSPENDED_RETENTION_SECONDS` (30 days by default) is released
   with reason `SUSPEND_EXPIRED`, deleting its directory and snapshot. Under
   disk pressure the same cycle first drops local copies of suspended sandboxes
   that have a snapshot. See [Suspend and resume](SUSPEND_RESUME.md).

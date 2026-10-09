@@ -114,10 +114,19 @@ with 409 `SANDBOX_SNAPSHOT_FAILED` and the sandbox stays `READY`. A shared
 workspace is never snapshotted. The snapshot is deleted when the sandbox
 resumes or is released.
 
+Sandloom deletes snapshots itself, so no bucket lifecycle rule is required. If
+you add one on `<BLOBSTORE_BASE_PREFIX>checkpoints/` as a backstop against a
+deletion that failed, make it expire objects **later** than
+`SANDBOX_SUSPENDED_RETENTION_SECONDS` (30 days by default), with margin for the
+maintenance interval and release retries; for example 35 days. A rule that
+expires earlier deletes the snapshot of a sandbox that is still suspended, and
+a resume that needs it (on another worker, or after disk eviction) then fails
+with `SANDBOX_WORKSPACE_LOST`. Raise the rule whenever you raise the retention.
+
 ## Retention and disk
 
 - **Retention.** A suspended sandbox is kept for
-  `SANDBOX_SUSPENDED_RETENTION_SECONDS` (default 604800, seven days) from the
+  `SANDBOX_SUSPENDED_RETENTION_SECONDS` (default 2592000, 30 days) from the
   moment it was suspended. The maintenance cycle then releases it with reason
   `SUSPEND_EXPIRED`, which deletes its directory on the worker and its
   snapshot. `0` keeps suspended sandboxes until a client releases them.
