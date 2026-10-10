@@ -179,6 +179,40 @@ with `SANDBOX_WORKSPACE_LOST`. Raise the rule whenever you raise the retention.
 `reclamation.suspended_retention_seconds`, and the orphaned-directory period
 under `reclamation.orphan_dormant_dir_ttl_seconds`.
 
+## Verified combinations
+
+Each row was brought up as a real Docker deployment (the Sandloom image, the
+named middleware, one or two workers; heartbeat 2 s, retention 90 s, orphan
+directory TTL 20 s) and driven through the same scenario set over HTTP:
+create and write, suspend (slot released, repeat is a no-op), `409
+SANDBOX_SUSPENDED` on exec, read, write and connect, resume (reuse, repeat,
+`resolve` auto-wake), suspend against a long exec (`409 SANDBOX_SUSPEND_BUSY`,
+other threads and sandboxes unaffected, plus eight exec/suspend races with
+exactly one winner each), capacity (`503` while full, retry succeeds once a slot
+frees), and retention expiry through the normal release (`SUSPEND_EXPIRED`,
+directory and snapshot gone, `409 STALE_SANDBOX_ROUTE` afterwards). Rows with
+two workers add the cross-worker case their storage allows.
+
+| Metadata | Registry | Object store | Storage | Workers | Also verified |
+| --- | --- | --- | --- | --- | --- |
+| SQLite | memory | none | local | 1 | `snapshot=false` |
+| SQLite | memory | S3 (LocalStack) | local | 1 | snapshot written on suspend, deleted on resume and on expiry |
+| PostgreSQL 16 | Redis 7 | S3 (LocalStack) | local | 2 | owner stopped: restore on the other worker, snapshot deleted, stale directory reclaimed after the orphan TTL while active and suspended neighbours are untouched; worker unreachable at expiry: `RELEASING`, then `RELEASE_RETRY` deletes the snapshot |
+| MySQL 8.4 | Redis 7 | S3 (LocalStack) | local | 2 | same as the PostgreSQL row |
+| PostgreSQL 16 | Redis 7 | none | local | 2 | owner stopped: `503 SANDBOX_DORMANT_WORKSPACE_UNAVAILABLE`, still `SUSPENDED`; owner back: resume reuses the directory |
+| MySQL 8.4 | Redis 7 | none | shared | 2 | `snapshot=false`; owner stopped: the other worker resumes the same directory; the old worker never deletes it |
+
+The metadata contract (`DormantRouteStore`) also runs against real MySQL and
+PostgreSQL servers, and the snapshot archive against a real S3 API, in
+`tests/integration/test_dormant_adapters.py` (`./scripts/integration-test.sh
+middleware`). A metadata store without `DormantRouteStore`, or an execution
+backend without `DormantLifecycle`, was run as a plugin: suspend answers `501
+SANDBOX_SUSPEND_UNSUPPORTED`, the sandbox stays `READY` and keeps working.
+
+Not exercised against a live deployment: disk-pressure eviction of a dormant
+directory (unit tests only), other S3 implementations than LocalStack, and
+object stores other than S3 (none ship with the project).
+
 ## Limitations
 
 - No process freezing and no memory restore. Background commands must have
