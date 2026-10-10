@@ -31,6 +31,22 @@ implementing `DormantRouteStore`, and an execution backend by implementing
 `DormantLifecycle`; without them the API answers 501
 `SANDBOX_SUSPEND_UNSUPPORTED`. See [Architecture](ARCHITECTURE.md).
 
+### S3-compatible stores
+
+The adapter speaks plain S3 with path-style addressing and signature v4, so any
+compatible store works. Two have been run against it end to end: LocalStack and
+RustFS (`rustfs/rustfs`). RustFS needs its access-key and secret-key
+variables set, a data directory writable by UID 10001, and its API port
+(9000) as `BLOBSTORE_ENDPOINT`; the bucket does not need to exist, because the
+workers create it at startup. Against RustFS, the following behaved exactly as
+against AWS S3 and needed no change: put/get/head/delete, deleting a missing key
+(204), a multipart upload of a 20 MB object (ETag `<hash>-<parts>`), listing with
+continuation across pages and past 1,000 keys, presigned GET and PUT,
+`If-None-Match: *` (a second write answers 412), a mismatched client region,
+default and `when_required` boto3 checksum modes, and a wrong secret (403).
+Virtual-host addressing was not exercised, because the endpoint was an IP
+address.
+
 ## Plugin discovery
 
 External Python distributions register factory functions in one or more of

@@ -151,7 +151,10 @@ with `SANDBOX_WORKSPACE_LOST`. Raise the rule whenever you raise the retention.
   copies of dormant sandboxes that have a snapshot, oldest first, until the
   disk recovers. They stay `SUSPENDED` and resume from the snapshot. A dormant
   sandbox without a snapshot is never evicted for disk; its directory is the
-  only copy.
+  only copy. The set of dormant sandboxes a worker may evict is kept in its
+  memory; after a restart, the first cycle that finds the disk over its
+  watermark asks the control plane which suspended routes still name this
+  worker and have a snapshot, and takes those back before it evicts.
 - **Copies left on the original worker.** A sandbox that resumed on another
   worker from its snapshot leaves its old directory on the worker it left (as
   does a sandbox released while its worker was down). Each worker's
@@ -200,6 +203,8 @@ two workers add the cross-worker case their storage allows.
 | PostgreSQL 16 | Redis 7 | S3 (LocalStack) | local | 2 | owner stopped: restore on the other worker, snapshot deleted, stale directory reclaimed after the orphan TTL while active and suspended neighbours are untouched; worker unreachable at expiry: `RELEASING`, then `RELEASE_RETRY` deletes the snapshot |
 | MySQL 8.4 | Redis 7 | S3 (LocalStack) | local | 2 | same as the PostgreSQL row |
 | PostgreSQL 16 | Redis 7 | none | local | 2 | owner stopped: `503 SANDBOX_DORMANT_WORKSPACE_UNAVAILABLE`, still `SUSPENDED`; owner back: resume reuses the directory |
+| PostgreSQL 16 | Redis 7 | S3 (RustFS 1.0) | local | 2 | same as the LocalStack rows, plus `scripts/verify-deployment.py` (templates built on one worker and mounted on another through the same store) |
+| PostgreSQL 16 | Redis 7 | S3 (RustFS 1.0) | local | 3 (one on a 128 MB disk, one more sharing it with `SANDBOX_SUSPEND_SNAPSHOT=never`) | disk pressure (below) |
 | MySQL 8.4 | Redis 7 | none | shared | 2 | `snapshot=false`; owner stopped: the other worker resumes the same directory; the old worker never deletes it |
 
 The metadata contract (`DormantRouteStore`) also runs against real MySQL and
@@ -209,17 +214,31 @@ middleware`). A metadata store without `DormantRouteStore`, or an execution
 backend without `DormantLifecycle`, was run as a plugin: suspend answers `501
 SANDBOX_SUSPEND_UNSUPPORTED`, the sandbox stays `READY` and keeps working.
 
-Not exercised against a live deployment: disk-pressure eviction of a dormant
-directory (unit tests only), other S3 implementations than LocalStack, and
-object stores other than S3 (none ship with the project).
+Disk pressure was run with the worker's workspace directory on a 128 MB ext4
+volume and `SANDBOX_DISK_HIGH_WATERMARK_PERCENT=60`. Over the watermark, only the
+oldest snapshotted dormant copy was removed, and eviction stopped as soon as the
+disk was back under it. With the disk pushed further over, the remaining
+snapshotted copies went in order of suspension while an active sandbox and a
+dormant sandbox without a snapshot were left alone, even though the disk stayed
+over the watermark. Every evicted sandbox stayed `SUSPENDED`, kept its snapshot
+until it resumed, and resumed with `workspace_source=restored` and an identical
+file digest; one that was not evicted resumed with `reused`. A worker restart kept
+the evictions on disk, and a worker that had restarted evicted again once the
+disk was over the watermark.
+
+Not exercised against a live deployment: S3 implementations other than
+LocalStack and RustFS, and object stores other than S3 (none ship with the
+project).
 
 ## Limitations
 
 - No process freezing and no memory restore. Background commands must have
   finished, and their results stay readable through the execution record.
 - Disk eviction is tracked in the worker's memory. A worker that restarts
-  forgets which dormant copies it evicted; their resume still restores from the
-  snapshot because the directory is missing.
+  forgets which dormant copies it evicted (their resume still restores from the
+  snapshot because the directory is missing) and which it may still evict (it
+  relearns those from the control plane, but only once the disk is over its
+  watermark).
 - With local storage and no snapshot, a worker that never comes back takes the
   dormant workspace with it, exactly as it would take a running one. Retention
   eventually releases the route.
