@@ -218,6 +218,10 @@ jobs:
       # The README's compose.yaml plus the one AppArmor opt-in this runner's
       # Docker needs; see the file for why it is not in compose.yaml itself.
       COMPOSE_FILE: compose.yaml:.github/ci/compose.apparmor.yaml
+      # Job level because Compose interpolates the whole file whenever it runs,
+      # including `config --images`, `logs` and `down`, and a missing token is an
+      # error there rather than an empty string.
+      SANDBOX_INTERNAL_TOKEN: ci-verification-token
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -244,8 +248,6 @@ jobs:
         # on a machine that has never built it.
         run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
       - name: Start the deployment the README describes
-        env:
-          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: docker compose up -d --wait --build
       - name: Scan the image for internal markers
         # What the build context put in the image, rather than the whole
@@ -253,8 +255,6 @@ jobs:
         # produce tens of thousands of findings on their own. The script targets
         # /app and refuses to run when /app holds no application code, so a
         # "clean" answer cannot mean "looked at nothing".
-        env:
-          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: ./scripts/scan-image.sh
       - name: Prove the image scan fails on an image that carries one
         # A gate that has only ever been seen pass may be wired to nothing. This
@@ -289,19 +289,10 @@ jobs:
         # --strict so a skipped check fails: a deployment that verified half of
         # what it claims is not verified. This is also the only thing that runs
         # `examples/`, so an example cannot rot into a script that misleads.
-        env:
-          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: uv run python scripts/verify-deployment.py --strict
       - name: Deployment logs on failure
         if: failure()
-        # Compose interpolates the whole file, token included, even to print
-        # logs; without it this step and the next one failed on their own and
-        # hid why the deployment did.
-        env:
-          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: docker compose logs --tail 200
       - name: Stop
         if: always()
-        env:
-          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: docker compose down -v
