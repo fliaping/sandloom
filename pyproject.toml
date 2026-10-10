@@ -76,6 +76,9 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "real_host_probe: exercises the host-setting probes themselves, so the hermetic preflight fixture stands aside",
+]
 
 [tool.uv.sources]
 sandloom-runtime = { path = "runtime", editable = true }
