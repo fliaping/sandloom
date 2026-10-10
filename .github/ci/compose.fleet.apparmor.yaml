@@ -1,0 +1,12 @@
+# CI only. See compose.apparmor.yaml: the same Docker AppArmor profile, applied
+# to each replica of the fleet file.
+services:
+  worker-a:
+    security_opt:
+      - apparmor=unconfined
+  worker-b:
+    security_opt:
+      - apparmor=unconfined
+  worker-c:
+    security_opt:
+      - apparmor=unconfined

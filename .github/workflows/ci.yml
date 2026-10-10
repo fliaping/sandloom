@@ -142,7 +142,7 @@ jobs:
         # The third replica runs with a different SANDBOX_PROFILE_HASH, behind the
         # fleet file's `other-profile` profile, so the checks that depend on a
         # fleet that is not uniform have one to look at.
-        run: docker compose -f compose.fleet.yaml --profile other-profile up -d --wait --build
+        run: docker compose -f compose.fleet.yaml -f .github/ci/compose.fleet.apparmor.yaml --profile other-profile up -d --wait --build
       - name: Verify what a fleet promises
         # The single-replica deployment job cannot see any of this: a request
         # forwarded to the replica that owns the sandbox, a template built on one
@@ -154,10 +154,10 @@ jobs:
         run: uv run python scripts/verify-fleet.py --strict --short-graces
       - name: Fleet logs on failure
         if: failure()
-        run: docker compose -f compose.fleet.yaml --profile other-profile logs --tail 200
+        run: docker compose -f compose.fleet.yaml -f .github/ci/compose.fleet.apparmor.yaml --profile other-profile logs --tail 200
       - name: Stop
         if: always()
-        run: docker compose -f compose.fleet.yaml --profile other-profile down -v
+        run: docker compose -f compose.fleet.yaml -f .github/ci/compose.fleet.apparmor.yaml --profile other-profile down -v
 
   package:
     name: Release artifacts
@@ -214,6 +214,10 @@ jobs:
   deployment:
     name: Deployment verification
     runs-on: ubuntu-latest
+    env:
+      # The README's compose.yaml plus the one AppArmor opt-in this runner's
+      # Docker needs; see the file for why it is not in compose.yaml itself.
+      COMPOSE_FILE: compose.yaml:.github/ci/compose.apparmor.yaml
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

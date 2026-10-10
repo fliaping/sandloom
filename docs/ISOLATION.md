@@ -205,6 +205,31 @@ Docker's default set, but `capsh --drop=cap_setfcap` and a tightened
 `CapabilityBoundingSet=` remove it. A non-root caller is unaffected — prefer
 one where there is the choice.
 
+### Hosts that enforce AppArmor
+
+Docker on a host that enforces AppArmor (Ubuntu, including GitHub's hosted
+runners) confines every container with its `docker-default` profile, which
+denies the `mount` Bubblewrap performs to make `/` a slave mount inside its new
+mount namespace. The startup probe then fails at every level with
+`bwrap: Failed to make / slave: Permission denied` and the service exits.
+Docker Desktop and OrbStack have no AppArmor, so the quick start does not hit it
+and the shipped Compose files do not carry the opt-in. On an AppArmor host add
+it to the trusted manager container, next to the `seccomp` setting:
+
+```yaml
+# compose.override.yaml
+services:
+  agent-sandbox:
+    security_opt:
+      - apparmor=unconfined
+```
+
+This widens the trusted manager's confinement in the same way as
+`seccomp=unconfined`; a platform that can load a narrower reviewed profile that
+permits those mounts should prefer it. The repository's own CI does exactly the
+override above (`.github/ci/compose.apparmor.yaml`) together with the sysctl
+in the previous section.
+
 ### Docker and compatible runtimes
 
 Docker's default seccomp profile blocks the nested namespace syscalls used by
