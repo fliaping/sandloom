@@ -139,6 +139,34 @@ def as_orphan_workspace_reclaim(backend: object) -> OrphanWorkspaceReclaim | Non
     return cast("OrphanWorkspaceReclaim", backend)
 
 
+class DormantAdoption(Protocol):
+    """Taking back a dormant sandbox this process no longer remembers.
+
+    Which dormant directories may be evicted under disk pressure is kept in the
+    worker's memory, so a restart forgets them and they would never be evicted.
+    The control plane still knows which suspended routes name this worker; it
+    hands those back through `adopt_dormant`. Optional. Narrow with
+    `as_dormant_adoption()`.
+    """
+
+    async def adopt_dormant(
+        self,
+        sandbox_id: str,
+        *,
+        generation: int,
+        uid: int,
+        suspended_at: float,
+        snapshot: bool,
+    ) -> bool: ...
+
+
+def as_dormant_adoption(backend: object) -> DormantAdoption | None:
+    """Narrow a backend to dormant adoption, or report that it cannot."""
+    if backend is None or not callable(getattr(backend, "adopt_dormant", None)):
+        return None
+    return cast("DormantAdoption", backend)
+
+
 def create_execution_backend(settings: Settings) -> ExecutionBackend:
     """Load the explicitly configured backend.
 

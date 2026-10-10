@@ -1095,6 +1095,53 @@ class SandboxRuntime:
                 break
         return evicted
 
+    async def adopt_dormant(
+        self,
+        sandbox_id: str,
+        *,
+        generation: int,
+        uid: int,
+        suspended_at: float,
+        snapshot: bool,
+    ) -> bool:
+        """Remember a dormant directory this process has forgotten, so disk pressure can evict it.
+
+        A restart empties `dormant`, and the directories it described stay on
+        disk. The control plane knows which suspended routes still name this
+        worker and whether their snapshot exists; this takes that back. It
+        changes no file. Returns whether the sandbox is newly remembered.
+        """
+        return await asyncio.to_thread(
+            self._adopt_dormant, sandbox_id, generation, uid, suspended_at, snapshot
+        )
+
+    def _adopt_dormant(
+        self, sandbox_id: str, generation: int, uid: int, suspended_at: float, snapshot: bool
+    ) -> bool:
+        try:
+            root = _sandbox_root(self.settings.workspace_root, sandbox_id)
+            with self._template_lock(sandbox_id):
+                if (
+                    sandbox_id in self.sandboxes
+                    or sandbox_id in self.dormant
+                    or sandbox_id in self._destroying
+                    or root.is_symlink()
+                    or not root.is_dir()
+                ):
+                    return False
+                self.dormant[sandbox_id] = DormantSandbox(
+                    sandbox_id=sandbox_id,
+                    generation=generation,
+                    uid=uid,
+                    suspended_at=suspended_at,
+                    snapshot=snapshot,
+                )
+                return True
+        except (RuntimeError, ValueError):
+            # A create, resume or release holds the lock, or the id is not a
+            # directory name: leave it to the next cycle.
+            return False
+
     def _evict_dormant(self, sandbox_id: str) -> bool:
         try:
             with self._template_lock(sandbox_id):

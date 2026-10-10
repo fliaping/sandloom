@@ -1167,3 +1167,64 @@ async def test_an_execution_backend_without_the_protocol_answers_501_and_stays_r
     assert (await _read(app, generation)).status_code == 200
     await service._maintenance()
     assert service.reaper_status["failures_total"] == 0
+
+
+# ── disk pressure after a restart ──
+
+
+async def test_a_restarted_worker_still_evicts_its_snapshotted_dormant_copies(
+    fleet: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, (app,) = fleet
+    service = app.state.sandbox_service
+    generation = await _ready_sandbox(app)
+    suspended = await _api(
+        app, "POST", "/api/v1/sandboxes/agent-1/suspend", json={"generation": generation}
+    )
+    assert suspended.json()["snapshot"] is True
+    root = service.settings.workspace_root / "agent-1"
+    # A restart: the directory stays, the worker's memory of it does not.
+    service.runtime.dormant.clear()
+    pressure = {"available": True}
+    real_status = service.runtime.disk_status
+    monkeypatch.setattr(
+        service.runtime,
+        "disk_status",
+        lambda: {**real_status(), "available": pressure["available"]},
+    )
+
+    await service._maintenance()
+    assert root.exists() and "agent-1" not in service.runtime.dormant  # no pressure: nothing to do
+
+    pressure["available"] = False
+    await service._maintenance()
+    assert not root.exists()
+    assert service.reaper_status["dormant_evicted_total"] == 1
+    route = await service.database.find_route("agent-1")
+    assert route is not None and route.status == "SUSPENDED"
+
+    pressure["available"] = True
+    resumed = await _api(app, "POST", "/api/v1/sandboxes/agent-1/resume")
+    assert resumed.json()["workspace_source"] == "restored"
+    assert (await _read(app, resumed.json()["generation"])).status_code == 200
+
+
+async def test_a_restarted_worker_keeps_a_dormant_copy_that_has_no_snapshot(
+    fleet: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, (app,) = fleet
+    service = app.state.sandbox_service
+    service.settings.suspend_snapshot = "never"
+    generation = await _ready_sandbox(app)
+    await _api(app, "POST", "/api/v1/sandboxes/agent-1/suspend", json={"generation": generation})
+    root = service.settings.workspace_root / "agent-1"
+    service.runtime.dormant.clear()
+    real_status = service.runtime.disk_status
+    monkeypatch.setattr(
+        service.runtime, "disk_status", lambda: {**real_status(), "available": False}
+    )
+
+    await service._maintenance()
+
+    assert root.exists()
+    assert "agent-1" not in service.runtime.dormant

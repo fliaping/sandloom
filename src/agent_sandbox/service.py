@@ -14,6 +14,7 @@ import httpx
 from .backends import (
     DormantLifecycle,
     ExecutionBackend,
+    as_dormant_adoption,
     as_dormant_lifecycle,
     as_orphan_workspace_reclaim,
     as_template_cache_pruning,
@@ -997,6 +998,7 @@ class SandboxService:
         runtime = as_dormant_lifecycle(self.runtime)
         if runtime is not None:
             try:
+                await self._adopt_forgotten_dormant(runtime)
                 evicted = await runtime.reclaim_dormant_disk()
                 if evicted:
                     self.reaper_status["dormant_evicted_total"] = cast(
@@ -1035,6 +1037,45 @@ class SandboxService:
                 )
                 logger.exception("failed to reclaim suspended sandbox: %s", route.sandbox_id)
         return released, gone_already
+
+    async def _adopt_forgotten_dormant(self, runtime: DormantLifecycle) -> None:
+        """Hand a restarted worker back the dormant copies it may evict.
+
+        Only under disk pressure, so a healthy disk costs nothing. A directory
+        qualifies when its route is suspended on this worker and its snapshot is
+        in the object store; without one it is the only copy and stays.
+        """
+        adoption = as_dormant_adoption(self.runtime)
+        local = as_orphan_workspace_reclaim(self.runtime)
+        if (
+            adoption is None
+            or local is None
+            or self.settings.shared_root is not None
+            or self.template_catalog.object_store is None
+            or self.runtime.disk_status()["available"]
+        ):
+            return
+        for sandbox_id in await local.local_workspace_ids():
+            if sandbox_id in runtime.dormant:
+                continue
+            route = await self.database.find_route(sandbox_id)
+            if (
+                route is None
+                or route.status != "SUSPENDED"
+                or route.worker_id != self.worker_id
+                or route.storage_mode == "shared"
+                or not await self._dormant_snapshot_exists(sandbox_id)
+            ):
+                continue
+            since = as_utc(route.updated_at).timestamp() if route.updated_at else time.time()
+            if await adoption.adopt_dormant(
+                sandbox_id,
+                generation=route.generation,
+                uid=route.sandbox_uid,
+                suspended_at=since,
+                snapshot=True,
+            ):
+                logger.info("took back a dormant workspace after a restart: %s", sandbox_id)
 
     async def _reclaim_orphan_workspaces(self) -> int:
         """Delete local workspace directories this worker no longer owns.
