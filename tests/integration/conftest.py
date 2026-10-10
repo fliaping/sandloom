@@ -92,6 +92,12 @@ def minio_endpoint() -> str:
     return MINIO_ENDPOINT
 
 
+@pytest.fixture(scope="session")
+def s3_credentials() -> tuple[str, str]:
+    """Access and secret key for the S3-compatible store (LocalStack, RustFS, MinIO, ...)."""
+    return MINIO_ACCESS_KEY, MINIO_SECRET_KEY
+
+
 @pytest.fixture
 def settings_factory(tmp_path: Path) -> Any:
     """Build Settings pointed at a real database with a per-test workspace."""

@@ -269,7 +269,7 @@ async def test_retention_expiry_and_stalled_suspends_are_listed(
 
 
 @pytest.fixture
-def blob_store(minio_endpoint: str) -> Iterator[BlobStore]:
+def blob_store(minio_endpoint: str, s3_credentials: tuple[str, str]) -> Iterator[BlobStore]:
     import boto3
     from botocore.config import Config
 
@@ -278,8 +278,8 @@ def blob_store(minio_endpoint: str) -> Iterator[BlobStore]:
     client = boto3.client(
         "s3",
         endpoint_url=minio_endpoint,
-        aws_access_key_id="integration",
-        aws_secret_access_key="integration-secret",
+        aws_access_key_id=s3_credentials[0],
+        aws_secret_access_key=s3_credentials[1],
         region_name="us-east-1",
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
