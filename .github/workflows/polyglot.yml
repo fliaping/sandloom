@@ -43,6 +43,17 @@ jobs:
         run: python -m pip install uv
       - name: Install project
         run: uv sync --frozen
+      - name: Allow unprivileged user namespaces
+        # ubuntu-latest is Ubuntu 24.04, which ships
+        # kernel.apparmor_restrict_unprivileged_userns=1: a process that creates
+        # a user namespace loses its capabilities inside it, so Bubblewrap cannot
+        # write its uid map ("setting up uid map: Permission denied") and no
+        # isolation level can be negotiated. That is the host this job runs on,
+        # not something the code under test can work around; the service reports
+        # it as a preflight warning. Switching the restriction off for the
+        # duration of the job is what the sandbox's own documentation tells an
+        # operator to do on such a host.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Free the disk the toolchain images need
         # Three images of roughly two gigabytes each, plus the build cache that
         # produced them, against a runner whose root filesystem also carries an

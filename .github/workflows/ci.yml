@@ -70,6 +70,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Allow unprivileged user namespaces
+        # ubuntu-latest is Ubuntu 24.04, which ships
+        # kernel.apparmor_restrict_unprivileged_userns=1: a process that creates
+        # a user namespace loses its capabilities inside it, so Bubblewrap cannot
+        # write its uid map ("setting up uid map: Permission denied") and no
+        # isolation level can be negotiated. That is the host this job runs on,
+        # not something the code under test can work around; the service reports
+        # it as a preflight warning. Switching the restriction off for the
+        # duration of the job is what the sandbox's own documentation tells an
+        # operator to do on such a host.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build the base image
         run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
       - name: Build the test image
@@ -114,6 +125,17 @@ jobs:
         run: python -m pip install uv
       - name: Install project
         run: uv sync --frozen
+      - name: Allow unprivileged user namespaces
+        # ubuntu-latest is Ubuntu 24.04, which ships
+        # kernel.apparmor_restrict_unprivileged_userns=1: a process that creates
+        # a user namespace loses its capabilities inside it, so Bubblewrap cannot
+        # write its uid map ("setting up uid map: Permission denied") and no
+        # isolation level can be negotiated. That is the host this job runs on,
+        # not something the code under test can work around; the service reports
+        # it as a preflight warning. Switching the restriction off for the
+        # duration of the job is what the sandbox's own documentation tells an
+        # operator to do on such a host.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build the base image
         run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
       - name: Start replicas over a shared database and registry
@@ -201,6 +223,17 @@ jobs:
         run: python -m pip install uv
       - name: Install project
         run: uv sync --frozen
+      - name: Allow unprivileged user namespaces
+        # ubuntu-latest is Ubuntu 24.04, which ships
+        # kernel.apparmor_restrict_unprivileged_userns=1: a process that creates
+        # a user namespace loses its capabilities inside it, so Bubblewrap cannot
+        # write its uid map ("setting up uid map: Permission denied") and no
+        # isolation level can be negotiated. That is the host this job runs on,
+        # not something the code under test can work around; the service reports
+        # it as a preflight warning. Switching the restriction off for the
+        # duration of the job is what the sandbox's own documentation tells an
+        # operator to do on such a host.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build the base image
         # The two commands the README gives a first-time reader, in order. The
         # service image is FROM agent-sandbox-base, so `compose up` alone fails
@@ -257,7 +290,14 @@ jobs:
         run: uv run python scripts/verify-deployment.py --strict
       - name: Deployment logs on failure
         if: failure()
+        # Compose interpolates the whole file, token included, even to print
+        # logs; without it this step and the next one failed on their own and
+        # hid why the deployment did.
+        env:
+          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: docker compose logs --tail 200
       - name: Stop
         if: always()
+        env:
+          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: docker compose down -v
