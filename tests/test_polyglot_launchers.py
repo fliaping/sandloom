@@ -25,6 +25,13 @@ def executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+# A compiler older than the one that links with lld by default does not know the
+# opt-out, and says so with a failing exit. The launcher tests below that are not
+# about the linker use tools like that, so the arguments they print are only the
+# ones the caller passed.
+OLDER_COMPILER = 'case "$*" in *linker-features*) exit 1 ;; esac\n'
+
+
 def test_java_launcher_preserves_arguments_and_scopes_library_path(
     tmp_path: Path, installer: ModuleType
 ) -> None:
@@ -59,7 +66,7 @@ def test_rust_launcher_supplies_sysroot_unless_explicit(
 ) -> None:
     home = tmp_path / "rust with spaces"
     for name in ("rustc", "cargo", "rustdoc"):
-        executable(home / "bin" / name, 'printf "%s\\n" "$LD_LIBRARY_PATH" "$@"\n')
+        executable(home / "bin" / name, OLDER_COMPILER + 'printf "%s\\n" "$LD_LIBRARY_PATH" "$@"\n')
     destination = tmp_path / "rust launchers"
     installer.install_rust(home, destination)
     result = subprocess.run(
@@ -76,7 +83,7 @@ def test_rust_launcher_supplies_sysroot_unless_explicit(
 def test_cargo_invokes_adapted_compiler_and_rustdoc(tmp_path: Path, installer: ModuleType) -> None:
     home = tmp_path / "rust"
     for name in ("rustc", "rustdoc"):
-        executable(home / "bin" / name, 'printf "%s\\n" "$@"\n')
+        executable(home / "bin" / name, OLDER_COMPILER + 'printf "%s\\n" "$@"\n')
     executable(home / "bin" / "cargo", '"$RUSTC" --version\n"$RUSTDOC" --version\n')
     destination = tmp_path / "launchers"
     installer.install_rust(home, destination)
@@ -84,6 +91,37 @@ def test_cargo_invokes_adapted_compiler_and_rustdoc(tmp_path: Path, installer: M
         [str(destination / "cargo")], capture_output=True, text=True, check=True
     )
     assert result.stdout.splitlines() == ["--sysroot", str(home), "--version"] * 2
+
+
+@pytest.mark.parametrize("tool", ["rustc", "rustdoc"])
+def test_rust_is_linked_with_the_system_linker_when_the_compiler_can_be_told_to(
+    tmp_path: Path, installer: ModuleType, tool: str
+) -> None:
+    """Rust 1.90's default linker finds itself through /proc/self/exe.
+
+    The `basic` level has no procfs, so the launcher must opt out of it — for
+    rustdoc as well, which links every doctest itself. A real compiler would
+    refuse an option it does not know; the fake one here accepts everything, so
+    the probe finds the opt-out supported."""
+    home = tmp_path / "rust"
+    for name in ("rustc", "rustdoc", "cargo"):
+        executable(home / "bin" / name, 'printf "%s\\n" "$@"\n')
+    destination = tmp_path / "launchers"
+    installer.install_rust(home, destination)
+
+    result = subprocess.run(
+        [str(destination / tool), "input.rs"], capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout.splitlines() == [
+        "--sysroot",
+        str(home),
+        "-C",
+        "linker-features=-lld",
+        "input.rs",
+    ]
+    cargo = (destination / "cargo").read_text()
+    assert "linker-features" not in cargo  # cargo reaches the compiler through RUSTC
 
 
 def test_rust_override_is_refused_explicitly(tmp_path: Path, installer: ModuleType) -> None:
