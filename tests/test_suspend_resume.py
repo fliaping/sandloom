@@ -1098,3 +1098,72 @@ async def test_an_expiry_that_fails_midway_is_finished_by_the_normal_retry(fleet
     assert not root.exists()
     assert store.keys() == []
     assert service.reaper_status["released_total"] == 1
+
+
+# ── adapters written before suspend existed ──
+
+
+class _WithoutDormantRoutes:
+    """A metadata store that predates `DormantRouteStore`: everything else delegates."""
+
+    _HIDDEN = frozenset(
+        {
+            "begin_suspend",
+            "finish_suspend",
+            "abort_suspend",
+            "begin_resume",
+            "abort_resume",
+            "list_dormant_routes_to_reclaim",
+        }
+    )
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._HIDDEN:
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
+async def test_a_metadata_store_without_the_protocol_answers_501_and_keeps_working(
+    fleet: Any,
+) -> None:
+    _, _, (app,) = fleet
+    service = app.state.sandbox_service
+    generation = await _ready_sandbox(app)
+    service.database = _WithoutDormantRoutes(service.database)
+
+    suspended = await _api(
+        app, "POST", "/api/v1/sandboxes/agent-1/suspend", json={"generation": generation}
+    )
+    resumed = await _api(app, "POST", "/api/v1/sandboxes/agent-1/resume")
+
+    assert (suspended.status_code, suspended.text) == (501, "SANDBOX_SUSPEND_UNSUPPORTED")
+    assert (resumed.status_code, resumed.text) == (501, "SANDBOX_SUSPEND_UNSUPPORTED")
+    assert (await _read(app, generation)).status_code == 200
+    # The maintenance cycle skips the dormant sweep instead of failing.
+    await service._maintenance()
+    assert service.reaper_status["failures_total"] == 0
+
+
+async def test_an_execution_backend_without_the_protocol_answers_501_and_stays_ready(
+    fleet: Any,
+) -> None:
+    _, _, (app,) = fleet
+    service = app.state.sandbox_service
+    generation = await _ready_sandbox(app)
+    service.runtime.suspend = None
+    service.runtime.resume = None
+    service.runtime.reclaim_dormant_disk = None
+
+    suspended = await _api(
+        app, "POST", "/api/v1/sandboxes/agent-1/suspend", json={"generation": generation}
+    )
+
+    assert (suspended.status_code, suspended.text) == (501, "SANDBOX_SUSPEND_UNSUPPORTED")
+    route = await service.database.find_route("agent-1")
+    assert route is not None and route.status == "READY"
+    assert (await _read(app, generation)).status_code == 200
+    await service._maintenance()
+    assert service.reaper_status["failures_total"] == 0
