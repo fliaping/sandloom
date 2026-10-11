@@ -43,6 +43,7 @@ Sandloom 是面向 AI Agent 的高密度执行服务。一个可信的 Worker �
 - 支持内存或 Redis Worker 注册与发现。
 - 支持兼容 S3 的对象存储，使用标准 AWS 凭据链，用于跨 Worker 分发可复用环境以及保存调用方的检查点归档；快照和恢复流程由调用方编排。
 - 通过 generation 隔离令牌，阻止旧 Worker 修改已经重新分配的工作空间。
+- 挂起与幂等恢复：等待中的 Agent 归还名额并保留工作空间，休眠工作空间有保留期限和磁盘回收。
 - 提供 REST 和无状态 Streamable HTTP MCP API。
 - 环境模板构建一次，即可在多个沙箱中以只读方式挂载。
 - `/admin` 提供无依赖的集群管理页面，无需前端构建，也不依赖 CDN。
@@ -307,6 +308,20 @@ POST /api/v1/sandboxes/my-agent/files/move   {"generation":1,"source":"/workspac
 | 409 | `SANDBOX_FILE_PATH_LOCKED` | 文件操作与生命周期级命令或同一路径操作冲突。 |
 
 文件 API 只锁定目标路径，因此不同文件的读写可以与正在执行的命令并行。写入通过临时文件和原子重命名完成，读取者不会看到写了一半的文件。
+
+## 挂起与恢复
+
+等待耗时任务的 Agent 无需一直占用名额。挂起会释放沙箱的容量名额并保留工作空间；恢复会重新申请名额，并以幂等方式接着使用原来的文件继续工作。
+
+```bash
+# 等待期间归还名额。有命令在运行时返回 409。
+POST /api/v1/sandboxes/my-agent/suspend   {"generation":3}
+
+# 稍后继续。幂等；之后使用返回的 generation。
+POST /api/v1/sandboxes/my-agent/resume
+```
+
+挂起与 exec 准入在同一行路由记录上原子判定：有命令在运行时挂起会被拒绝（`409 SANDBOX_SUSPEND_BUSY`），已挂起的沙箱会拒绝命令（`409 SANDBOX_SUSPENDED`），不会影响其他沙箱或其他 scope。恢复时优先在原 Worker 上复用目录；否则通过共享工作空间或对象存储快照迁移到其他 Worker。挂起的沙箱在 `SANDBOX_SUSPENDED_RETENTION_SECONDS`（默认 30 天）后被释放。不冻结进程，也不恢复内存。状态机、快照和磁盘回收见[挂起与恢复](docs/SUSPEND_RESUME.md)。
 
 ## 环境模板
 

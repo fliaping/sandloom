@@ -66,6 +66,8 @@ execution-backend SPI for isolate, VM, or remote backends. See
   reusable environments cross workers on, and where a caller keeps checkpoint
   archives. Snapshot and restore are the caller's to orchestrate.
 - Generation fencing so stale workers cannot mutate reassigned workspaces.
+- Suspend and idempotent resume: a waiting agent gives its slot back and keeps
+  its workspace, with a retention period and disk reclamation for dormant ones.
 - REST and stateless Streamable HTTP MCP APIs.
 - Reusable environment templates, built once and mounted read-only everywhere.
 - A dependency-free fleet console at `/admin`: no build step, no CDN.
@@ -480,6 +482,30 @@ sandbox (default 16). Responses distinguish the two rejection reasons:
 File API calls lock only the target path, so reads and writes to different
 files stay concurrent with running commands. Writes go through a temporary
 file and an atomic rename, so a reader never observes a partial file.
+
+## Suspend and resume
+
+An agent waiting on something slow does not need to hold a slot. Suspend
+releases the sandbox's capacity slot and keeps its workspace; resume takes a
+slot again and continues with the same files, idempotently.
+
+```bash
+# Give the slot back while waiting. Refused with 409 while anything runs.
+POST /api/v1/sandboxes/my-agent/suspend   {"generation":3}
+
+# Continue later. Idempotent; use the generation it returns from then on.
+POST /api/v1/sandboxes/my-agent/resume
+```
+
+Suspend and exec admission are decided on the same route row, so a running
+command refuses the suspend (`409 SANDBOX_SUSPEND_BUSY`) and a suspended sandbox
+refuses commands (`409 SANDBOX_SUSPENDED`); other sandboxes and scopes are never
+touched. Resume reuses the directory on the original worker when it can, and
+otherwise moves the sandbox to another worker from a shared workspace or an
+object-store snapshot. Suspended sandboxes are released after
+`SANDBOX_SUSPENDED_RETENTION_SECONDS` (30 days by default). No process is
+frozen and no memory is restored. See [Suspend and resume](docs/SUSPEND_RESUME.md)
+for the state machine, snapshots, and disk reclamation.
 
 ## Environment templates
 

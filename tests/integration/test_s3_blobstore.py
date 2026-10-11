@@ -24,15 +24,15 @@ BUCKET = "agent-sandbox-integration"
 
 
 @pytest.fixture
-def s3_client(minio_endpoint: str) -> Any:
+def s3_client(minio_endpoint: str, s3_credentials: tuple[str, str]) -> Any:
     import boto3
     from botocore.config import Config
 
     return boto3.client(
         "s3",
         endpoint_url=minio_endpoint,
-        aws_access_key_id="integration",
-        aws_secret_access_key="integration-secret",
+        aws_access_key_id=s3_credentials[0],
+        aws_secret_access_key=s3_credentials[1],
         region_name="us-east-1",
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )

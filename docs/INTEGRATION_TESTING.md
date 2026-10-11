@@ -77,6 +77,12 @@ caught only by executing the interpreter.
 Databases use `tmpfs` for their data directories: the suite drops and recreates
 the schema per test, so persistence would only slow it down.
 
+Any S3-compatible store can stand in for LocalStack through the
+`SANDBOX_TEST_MINIO_ENDPOINT`, `SANDBOX_TEST_MINIO_ACCESS_KEY` and
+`SANDBOX_TEST_MINIO_SECRET_KEY` variables below; the suite also passes against RustFS
+(`rustfs/rustfs`, started with its access-key and secret-key variables, data
+directory writable by UID 10001).
+
 LocalStack is pinned to a community release. MinIO's Docker Hub images now
 require authentication to pull, and LocalStack's `stable` and `latest` tags
 resolve to the Pro image, which exits at startup without a license token.

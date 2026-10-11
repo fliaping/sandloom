@@ -104,6 +104,7 @@ run_polyglot_tests() {
   echo "==> verifying every language at basic without procfs"
   docker run --rm \
     --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
     -v "$(pwd)/scripts:/verification:ro" \
     --entrypoint /app/.venv/bin/python \
     "${POLYGLOT_IMAGE}" /verification/verify-polyglot-runtime.py --levels basic
@@ -114,6 +115,7 @@ run_polyglot_tests() {
   docker rm -f agent-sandbox-polyglot >/dev/null 2>&1 || true
   docker run -d --name agent-sandbox-polyglot \
     --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
     --security-opt systempaths=unconfined \
     -e SANDBOX_INTERNAL_TOKEN="${POLYGLOT_TOKEN}" \
     -e SANDBOX_ADVERTISE_HOST=localhost \

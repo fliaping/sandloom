@@ -40,6 +40,25 @@ def install_java(java_home: Path, destination: Path) -> None:
             )
 
 
+def _lld_can_be_opted_out(tool: Path) -> bool:
+    """Whether this compiler understands `-C linker-features=-lld`.
+
+    Rust 1.90 started linking with its bundled `rust-lld` by default on
+    x86_64 Linux, through a `gcc-ld/ld.lld` wrapper that finds the real linker
+    by reading `/proc/self/exe`. In the procfs-free `basic` level there is no
+    `/proc`, so every link ends in `lld-wrapper: could not get the path of the
+    current executable`. Older compilers link with the system linker and do not
+    know the option, so it is only passed to a tool that accepts it. `rustdoc`
+    needs it as much as `rustc`: it links every doctest itself."""
+    result = subprocess.run(
+        [str(tool), "-C", "linker-features=-lld", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def install_rust(sysroot: Path, destination: Path) -> None:
     """Call pinned native tools directly; rustup's proxies need self-discovery."""
     sysroot = sysroot.resolve(strict=True)
@@ -62,6 +81,10 @@ def install_rust(sysroot: Path, destination: Path) -> None:
                 f"export RUSTDOC={shlex.quote(str(destination / 'rustdoc'))}\n"
             )
         else:
+            if _lld_can_be_opted_out(binary):
+                # Link with the system linker, which needs no procfs. This only
+                # changes which linker runs; the output is the same program.
+                body += 'set -- -C linker-features=-lld "$@"\n'
             # rustc/rustdoc normally derive the sysroot from current_exe(),
             # which is /proc/self/exe on Linux. Explicit sysroots still work.
             body += (

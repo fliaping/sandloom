@@ -328,39 +328,14 @@ class SqlAlchemyDatabase:
                 return current
             row = dict(row_mapping)
             now = utc_now_naive()
-            history = bounded_lifecycle_history(row.get("lifecycle_history_json"), now=now)
-            values: dict[str, Any] = {
-                "worker_id": worker["worker_id"],
-                "worker_epoch": worker["worker_epoch"],
-                "profile_hash": new_hash,
-                "generation": route.generation + 1,
-                "status": "ASSIGNED",
-                "active_exec_id": None,
-                "last_active_at": now,
-                "generation_started_at": now,
-                "generation_created_by": created_by,
-                "ready_at": None,
-                "lifecycle_count": int(row.get("lifecycle_count") or 1) + 1,
-                "updated_at": now,
-            }
-            if row["status"] != "RELEASED":
-                event = completed_lifecycle(
-                    row,
-                    released_at=now,
-                    reason=reason,
-                    released_by="system:route-reassign",
-                )
-                history = bounded_lifecycle_history(history, event=event, now=now)
-                lifetime_ms = int(event["lifetime_ms"])
-                values.update(
-                    last_released_generation=route.generation,
-                    last_released_at=now,
-                    last_release_reason=reason,
-                    last_released_by="system:route-reassign",
-                    last_lifetime_ms=lifetime_ms,
-                    total_lifetime_ms=int(row.get("total_lifetime_ms") or 0) + lifetime_ms,
-                )
-            values["lifecycle_history_json"] = history
+            values = _reassignment_values(
+                row,
+                worker,
+                profile_hash=new_hash,
+                reason=reason,
+                created_by=created_by,
+                now=now,
+            )
             updated = await connection.execute(
                 update(route_table)
                 .where(
@@ -420,7 +395,8 @@ class SqlAlchemyDatabase:
                 .where(
                     route_table.c.sandbox_id == sandbox_id,
                     route_table.c.generation == generation,
-                    route_table.c.status.not_in(("RELEASED", "RELEASING")),
+                    # A dormant route's last_active_at is its retention clock.
+                    route_table.c.status.not_in(_INACTIVE_STATUSES),
                 )
                 .values(last_active_at=now, updated_at=now)
             )
@@ -684,6 +660,14 @@ class SqlAlchemyDatabase:
             )
             route = route_result.mappings().first()
             if (
+                route is not None
+                and int(route["generation"]) == generation
+                and str(route["status"]) in _DORMANT_STATUSES
+            ):
+                # Admission and suspend both decide on this locked row, so an
+                # exec either got in before the suspend or is refused here.
+                raise RuntimeError("SANDBOX_SUSPENDED")
+            if (
                 route is None
                 or int(route["generation"]) != generation
                 or str(route["status"]) not in {"ASSIGNED", "READY", "RUNNING"}
@@ -722,11 +706,15 @@ class SqlAlchemyDatabase:
             )
             # active_exec_id keeps one representative execution for operators;
             # it is no longer an admission gate.
-            await connection.execute(
+            admitted = await connection.execute(
                 update(route_table)
                 .where(
                     route_table.c.sandbox_id == sandbox_id,
                     route_table.c.generation == generation,
+                    # Re-checked in the write itself: SQLite has no FOR UPDATE,
+                    # so the read above can predate a suspend or release that
+                    # committed since. Zero rows rolls the insert back.
+                    route_table.c.status.in_(("ASSIGNED", "READY", "RUNNING")),
                 )
                 .values(
                     active_exec_id=func.coalesce(route_table.c.active_exec_id, exec_id),
@@ -735,6 +723,20 @@ class SqlAlchemyDatabase:
                     updated_at=now,
                 )
             )
+            if admitted.rowcount != 1:
+                status_now = (
+                    await connection.execute(
+                        select(route_table.c.status).where(
+                            route_table.c.sandbox_id == sandbox_id,
+                            route_table.c.generation == generation,
+                        )
+                    )
+                ).scalar()
+                raise RuntimeError(
+                    "SANDBOX_SUSPENDED"
+                    if status_now in _DORMANT_STATUSES
+                    else "STALE_SANDBOX_GENERATION"
+                )
         return None
 
     async def finish_exec(
@@ -824,6 +826,187 @@ class SqlAlchemyDatabase:
             )
             row = result.mappings().first()
         return _exec_row(dict(row)) if row else None
+
+    # ── suspend and resume ──
+    #
+    # READY -> SUSPENDING -> SUSPENDED -> ASSIGNED -> READY. Each step is a
+    # conditional update on (sandbox_id, generation, status), so it either
+    # happens exactly once or reports what happened instead.
+
+    async def begin_suspend(self, sandbox_id: str, generation: int) -> bool:
+        """Claim an idle route for suspension.
+
+        True when this call claimed it, or a previous suspend is still in
+        flight and should be finished; False when it is already suspended.
+        Raises `SANDBOX_SUSPEND_BUSY` while a command runs, and
+        `STALE_SANDBOX_GENERATION` when the caller's generation is not current.
+        """
+        now = utc_now_naive()
+        async with self._engine().begin() as connection:
+            result = await connection.execute(
+                update(route_table)
+                .where(
+                    route_table.c.sandbox_id == sandbox_id,
+                    route_table.c.generation == generation,
+                    route_table.c.active_exec_id.is_(None),
+                    route_table.c.status == "READY",
+                )
+                .values(status="SUSPENDING", updated_at=now)
+            )
+            if result.rowcount == 1:
+                return True
+        current = await self.find_route(sandbox_id)
+        if current is None or current.generation != generation:
+            raise RuntimeError("STALE_SANDBOX_GENERATION")
+        if current.status == "SUSPENDED":
+            return False
+        if current.status == "SUSPENDING":
+            return True
+        if current.status == "RUNNING":
+            raise RuntimeError("SANDBOX_SUSPEND_BUSY")
+        if current.status == "ASSIGNED":
+            # Resolved but never created: there is no slot to release yet.
+            raise RuntimeError("SANDBOX_NOT_READY")
+        raise RuntimeError("STALE_SANDBOX_GENERATION")
+
+    async def finish_suspend(self, sandbox_id: str, generation: int) -> None:
+        now = utc_now_naive()
+        async with self._engine().begin() as connection:
+            await connection.execute(
+                update(route_table)
+                .where(
+                    route_table.c.sandbox_id == sandbox_id,
+                    route_table.c.generation == generation,
+                    route_table.c.status == "SUSPENDING",
+                )
+                # last_active_at starts the retention clock.
+                .values(status="SUSPENDED", active_exec_id=None, last_active_at=now, updated_at=now)
+            )
+        current = await self.find_route(sandbox_id)
+        if current is None or current.generation != generation or current.status != "SUSPENDED":
+            raise RuntimeError("STALE_SANDBOX_GENERATION")
+
+    async def abort_suspend(self, sandbox_id: str, generation: int) -> None:
+        now = utc_now_naive()
+        async with self._engine().begin() as connection:
+            await connection.execute(
+                update(route_table)
+                .where(
+                    route_table.c.sandbox_id == sandbox_id,
+                    route_table.c.generation == generation,
+                    route_table.c.status == "SUSPENDING",
+                )
+                .values(status="READY", updated_at=now)
+            )
+
+    async def begin_resume(
+        self,
+        route: Route,
+        worker: dict[str, Any],
+        *,
+        bump_generation: bool,
+        profile_hash: str,
+        created_by: str,
+    ) -> Route | None:
+        """Claim a suspended route for one worker, or return None if another call won.
+
+        Without `bump_generation` the route stays on its worker at its
+        generation, so a client holding that generation keeps using it. Moving
+        to another worker, or to a restarted one, is a reassignment and bumps
+        the generation exactly like any other, which fences the old owner.
+        """
+        async with self._engine().begin() as connection:
+            result = await connection.execute(
+                select(route_table)
+                .where(
+                    route_table.c.sandbox_id == route.sandbox_id,
+                    route_table.c.generation == route.generation,
+                    route_table.c.status == "SUSPENDED",
+                )
+                .with_for_update()
+            )
+            row_mapping = result.mappings().first()
+            if row_mapping is None:
+                return None
+            now = utc_now_naive()
+            if bump_generation:
+                values = _reassignment_values(
+                    dict(row_mapping),
+                    worker,
+                    profile_hash=profile_hash,
+                    reason="RESUME_REASSIGNED",
+                    created_by=created_by,
+                    now=now,
+                )
+            else:
+                values = {
+                    "status": "ASSIGNED",
+                    "worker_epoch": worker["worker_epoch"],
+                    "last_active_at": now,
+                    "updated_at": now,
+                }
+            updated = await connection.execute(
+                update(route_table)
+                .where(
+                    route_table.c.sandbox_id == route.sandbox_id,
+                    route_table.c.generation == route.generation,
+                    route_table.c.status == "SUSPENDED",
+                )
+                .values(**values)
+            )
+            if updated.rowcount != 1:
+                return None
+        return await self.find_route(route.sandbox_id)
+
+    async def abort_resume(self, sandbox_id: str, generation: int) -> None:
+        """Put a route whose resume failed back to sleep, where a retry can find it."""
+        now = utc_now_naive()
+        async with self._engine().begin() as connection:
+            await connection.execute(
+                update(route_table)
+                .where(
+                    route_table.c.sandbox_id == sandbox_id,
+                    route_table.c.generation == generation,
+                    route_table.c.status == "ASSIGNED",
+                )
+                .values(status="SUSPENDED", updated_at=now)
+            )
+
+    async def list_dormant_routes_to_reclaim(
+        self,
+        *,
+        retention_seconds: int,
+        suspending_grace_seconds: int,
+        limit: int,
+    ) -> list[Route]:
+        """Suspended routes past retention, and suspends that stalled midway.
+
+        `retention_seconds=0` keeps suspended routes indefinitely; stalled
+        suspends are still returned so they can be finished.
+        """
+        now = utc_now_naive()
+        conditions = [
+            and_(
+                route_table.c.status == "SUSPENDING",
+                route_table.c.updated_at < now - timedelta(seconds=suspending_grace_seconds),
+            )
+        ]
+        if retention_seconds > 0:
+            conditions.append(
+                and_(
+                    route_table.c.status == "SUSPENDED",
+                    route_table.c.last_active_at < now - timedelta(seconds=retention_seconds),
+                )
+            )
+        async with self._engine().connect() as connection:
+            result = await connection.execute(
+                select(route_table)
+                .where(or_(*conditions))
+                .order_by(route_table.c.last_active_at.asc())
+                .limit(limit)
+            )
+            rows = result.mappings().all()
+        return [route_from_mapping(dict(row)) for row in rows]
 
     # ── fleet queries ──
     #
@@ -936,6 +1119,57 @@ class SqlAlchemyDatabase:
             )
             rows = result.mappings().all()
         return [dict(row) for row in rows]
+
+
+_DORMANT_STATUSES = frozenset({"SUSPENDING", "SUSPENDED"})
+_INACTIVE_STATUSES = ("RELEASED", "RELEASING", "SUSPENDING", "SUSPENDED")
+
+
+def _reassignment_values(
+    row: dict[str, Any],
+    worker: dict[str, Any],
+    *,
+    profile_hash: str,
+    reason: str,
+    created_by: str,
+    now: Any,
+) -> dict[str, Any]:
+    """The columns a reassignment writes: next generation, new owner, audit event."""
+    generation = int(row["generation"])
+    history = bounded_lifecycle_history(row.get("lifecycle_history_json"), now=now)
+    values: dict[str, Any] = {
+        "worker_id": worker["worker_id"],
+        "worker_epoch": worker["worker_epoch"],
+        "profile_hash": profile_hash,
+        "generation": generation + 1,
+        "status": "ASSIGNED",
+        "active_exec_id": None,
+        "last_active_at": now,
+        "generation_started_at": now,
+        "generation_created_by": created_by,
+        "ready_at": None,
+        "lifecycle_count": int(row.get("lifecycle_count") or 1) + 1,
+        "updated_at": now,
+    }
+    if row["status"] != "RELEASED":
+        event = completed_lifecycle(
+            row,
+            released_at=now,
+            reason=reason,
+            released_by="system:route-reassign",
+        )
+        history = bounded_lifecycle_history(history, event=event, now=now)
+        lifetime_ms = int(event["lifetime_ms"])
+        values.update(
+            last_released_generation=generation,
+            last_released_at=now,
+            last_release_reason=reason,
+            last_released_by="system:route-reassign",
+            last_lifetime_ms=lifetime_ms,
+            total_lifetime_ms=int(row.get("total_lifetime_ms") or 0) + lifetime_ms,
+        )
+    values["lifecycle_history_json"] = history
+    return values
 
 
 def database_backend_name(settings: Settings) -> str:

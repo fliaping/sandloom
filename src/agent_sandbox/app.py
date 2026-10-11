@@ -44,8 +44,12 @@ from .schemas import (
     MakeDirectoryRequest,
     MovePathRequest,
     ResolveRequest,
+    ResumeLocalRequest,
+    ResumeResponse,
     RouteResponse,
     SandboxAuditResponse,
+    SuspendResponse,
+    SuspendSandboxRequest,
     TemplateAttachRequest,
     TemplateBuildRequest,
     TemplateListResponse,
@@ -80,6 +84,7 @@ _REQUEST_FIELDS = frozenset().union(
             ExecRequest,
             FileWriteRequest,
             ResolveRequest,
+            SuspendSandboxRequest,
         )
     )
 )
@@ -161,6 +166,16 @@ _STATUS_BY_CODE = {
     "SANDBOX_EXEC_SCOPE_BUSY": 409,
     "SANDBOX_EXEC_SCOPE_LOCKED": 409,
     "SANDBOX_FILE_PATH_LOCKED": 409,
+    # Suspend and resume. A suspended sandbox refuses work until it is resumed;
+    # a suspend refuses while anything runs in it. Both are the caller's move.
+    "SANDBOX_NOT_FOUND": 404,
+    "SANDBOX_SUSPENDED": 409,
+    "SANDBOX_SUSPEND_BUSY": 409,
+    "SANDBOX_SUSPEND_IN_PROGRESS": 409,
+    "SANDBOX_NOT_READY": 409,
+    "SANDBOX_SNAPSHOT_FAILED": 409,
+    "SANDBOX_SUSPEND_UNSUPPORTED": 501,
+    "SANDBOX_SNAPSHOT_UNAVAILABLE": 501,
     # The deployment's object store, not the request: templates cannot be shared
     # until an operator fixes the bucket, and a retry after that is the same call.
     "OBJECT_STORE_UNAVAILABLE": 503,
@@ -185,6 +200,8 @@ def reclamation_periods(config: Settings) -> dict[str, float]:
         "idle_ttl_seconds": config.idle_ttl_seconds,
         "orphan_running_grace_seconds": config.orphan_running_grace_seconds,
         "orphan_release_grace_seconds": config.orphan_release_grace_seconds,
+        "suspended_retention_seconds": config.suspended_retention_seconds,
+        "orphan_dormant_dir_ttl_seconds": config.orphan_dormant_dir_ttl_seconds,
     }
 
 
@@ -527,6 +544,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def delete_template(name: str, _: InternalAuth) -> dict[str, str]:
         removed = service.remove_template(name)
         return {"status": "REMOVED" if removed else "NOT_FOUND", "name": name}
+
+    @app.post("/api/v1/sandboxes/{sandbox_id}/suspend", response_model=SuspendResponse)
+    async def suspend_sandbox(
+        sandbox_id: str, request: SuspendSandboxRequest, _: InternalAuth
+    ) -> SuspendResponse:
+        """Release the sandbox's capacity slot and keep its workspace.
+
+        Refused with 409 `SANDBOX_SUSPEND_BUSY` while any command or file call
+        is running. Repeating it on a suspended sandbox changes nothing.
+        """
+        return await service.suspend(sandbox_id, request.generation)
+
+    @app.post("/api/v1/sandboxes/{sandbox_id}/resume", response_model=ResumeResponse)
+    async def resume_sandbox(sandbox_id: str, _: InternalAuth) -> ResumeResponse:
+        """Take a slot again and return the route to use. A no-op when awake.
+
+        The generation changes only if the sandbox moved to another worker.
+        """
+        return await service.resume(sandbox_id)
 
     @app.delete("/api/v1/sandboxes/{sandbox_id}")
     async def release(sandbox_id: str, _: InternalAuth) -> dict[str, str]:
@@ -918,6 +954,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await service.validate_local_route(sandbox_id, request.generation)
         attached = await complete_in_thread(service.attach_templates, sandbox_id, request)
         return {"status": "ATTACHED", "templates": attached}
+
+    @app.post("/internal/v1/sandboxes/{sandbox_id}/suspend")
+    async def suspend_local(
+        sandbox_id: str,
+        request: SuspendSandboxRequest,
+        _: InternalAuth,
+        worker_id: Annotated[str | None, Header(alias="X-Sandbox-Worker-ID")] = None,
+    ) -> dict[str, object]:
+        if worker_id != service.worker_id:
+            raise HTTPException(status_code=409, detail="STALE_SANDBOX_ROUTE")
+        route = await service.validate_local_route(
+            sandbox_id, request.generation, allow_dormant=True
+        )
+        if route.status not in {"SUSPENDING", "SUSPENDED"}:
+            # Only a claimed route is suspended; the claim is what fences exec.
+            raise HTTPException(status_code=409, detail="STALE_SANDBOX_ROUTE")
+        result = await service.dormant_runtime().suspend(
+            sandbox_id, request.generation, snapshot=service.snapshot_on_suspend(route)
+        )
+        await service.refresh_capacity()
+        return {"sandbox_id": sandbox_id, "generation": request.generation, **result}
+
+    @app.post("/internal/v1/sandboxes/{sandbox_id}/resume")
+    async def resume_local(
+        sandbox_id: str,
+        request: ResumeLocalRequest,
+        _: InternalAuth,
+        worker_id: Annotated[str | None, Header(alias="X-Sandbox-Worker-ID")] = None,
+    ) -> dict[str, object]:
+        if worker_id != service.worker_id or request.worker_epoch != service.worker_epoch:
+            raise HTTPException(status_code=409, detail="STALE_SANDBOX_ROUTE")
+        route = await service.validate_local_route(sandbox_id, request.generation)
+        if route.sandbox_uid != request.sandbox_uid or route.profile_id != request.profile:
+            raise HTTPException(status_code=409, detail="STALE_SANDBOX_ROUTE")
+        runtime = service.dormant_runtime()
+        if (
+            sandbox_id not in service.runtime.sandboxes
+            and len(service.runtime.sandboxes) >= config.worker_capacity
+        ):
+            # Resuming takes a slot like creating does; this worker has none.
+            raise RuntimeError("NO_SANDBOX_WORKER_AVAILABLE")
+        sandbox, source = await runtime.resume(
+            sandbox_id, request.generation, request.sandbox_uid, restore=request.restore
+        )
+        # Before READY, so a suspend that follows cannot have its fresh
+        # snapshot deleted by this one's cleanup.
+        await service.delete_dormant_snapshot(sandbox_id)
+        await database.mark_route_ready(
+            sandbox_id, request.generation, service.worker_id, service.worker_epoch
+        )
+        await service.refresh_capacity()
+        return {
+            "sandbox_id": sandbox_id,
+            "generation": sandbox.generation,
+            "uid": sandbox.uid,
+            "status": "READY",
+            "workspace_source": source,
+        }
 
     @app.delete("/internal/v1/sandboxes/{sandbox_id}")
     async def destroy_local(

@@ -90,6 +90,38 @@ class ConnectSandboxRequest(BaseModel):
     generation: int = Field(ge=1)
 
 
+class SuspendSandboxRequest(BaseModel):
+    """Release a sandbox's capacity slot and keep its workspace until resumed."""
+
+    generation: int = Field(ge=1)
+
+
+class SuspendResponse(BaseModel):
+    sandbox_id: str
+    generation: int
+    status: str
+    # Whether the object store holds a copy, so a resume can land on any worker.
+    snapshot: bool = False
+    # False when the sandbox was already suspended: the call changed nothing.
+    suspended: bool = True
+    # When the reaper will release it; None when retention is disabled.
+    retained_until: UtcDatetime | None = None
+
+
+class ResumeLocalRequest(CreateSandboxRequest):
+    """Worker protocol: register a dormant sandbox again."""
+
+    restore: Literal["reuse", "snapshot"] = "reuse"
+
+
+class ResumeResponse(RouteResponse):
+    # False when the sandbox was already awake: the call changed nothing.
+    resumed: bool = True
+    # `active`: it was not suspended. `reused`: its directory was still on the
+    # worker. `restored`: it was rebuilt from the snapshot.
+    workspace_source: Literal["active", "reused", "restored"] = "reused"
+
+
 class ExecRequest(BaseModel):
     exec_id: str = Field(min_length=3, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
     generation: int = Field(ge=1)

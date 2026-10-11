@@ -1,0 +1,13 @@
+# CI only. Layered over compose.yaml on the GitHub-hosted runners, whose Docker
+# enforces its `docker-default` AppArmor profile. That profile denies the
+# `mount` Bubblewrap performs to make `/` a slave mount inside its new mount
+# namespace, so every isolation level fails the startup probe with
+# `bwrap: Failed to make / slave: Permission denied` and the service exits.
+# The Docker Desktop and OrbStack hosts the quick start is written against have
+# no AppArmor, which is why compose.yaml itself does not carry this: the
+# Compose file stays the narrow default, and a host that enforces AppArmor opts
+# in deliberately (docs/ISOLATION.md, "Hosts that enforce AppArmor").
+services:
+  agent-sandbox:
+    security_opt:
+      - apparmor=unconfined

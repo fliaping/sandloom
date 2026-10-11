@@ -70,6 +70,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Allow unprivileged user namespaces
+        # ubuntu-latest is Ubuntu 24.04, which ships
+        # kernel.apparmor_restrict_unprivileged_userns=1: a process that creates
+        # a user namespace loses its capabilities inside it, so Bubblewrap cannot
+        # write its uid map ("setting up uid map: Permission denied") and no
+        # isolation level can be negotiated. That is the host this job runs on,
+        # not something the code under test can work around; the service reports
+        # it as a preflight warning. Switching the restriction off for the
+        # duration of the job is what the sandbox's own documentation tells an
+        # operator to do on such a host.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build the base image
         run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
       - name: Build the test image
@@ -114,13 +125,24 @@ jobs:
         run: python -m pip install uv
       - name: Install project
         run: uv sync --frozen
+      - name: Allow unprivileged user namespaces
+        # ubuntu-latest is Ubuntu 24.04, which ships
+        # kernel.apparmor_restrict_unprivileged_userns=1: a process that creates
+        # a user namespace loses its capabilities inside it, so Bubblewrap cannot
+        # write its uid map ("setting up uid map: Permission denied") and no
+        # isolation level can be negotiated. That is the host this job runs on,
+        # not something the code under test can work around; the service reports
+        # it as a preflight warning. Switching the restriction off for the
+        # duration of the job is what the sandbox's own documentation tells an
+        # operator to do on such a host.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build the base image
         run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
       - name: Start replicas over a shared database and registry
         # The third replica runs with a different SANDBOX_PROFILE_HASH, behind the
         # fleet file's `other-profile` profile, so the checks that depend on a
         # fleet that is not uniform have one to look at.
-        run: docker compose -f compose.fleet.yaml --profile other-profile up -d --wait --build
+        run: docker compose -f compose.fleet.yaml -f .github/ci/compose.fleet.apparmor.yaml --profile other-profile up -d --wait --build
       - name: Verify what a fleet promises
         # The single-replica deployment job cannot see any of this: a request
         # forwarded to the replica that owns the sandbox, a template built on one
@@ -132,10 +154,10 @@ jobs:
         run: uv run python scripts/verify-fleet.py --strict --short-graces
       - name: Fleet logs on failure
         if: failure()
-        run: docker compose -f compose.fleet.yaml --profile other-profile logs --tail 200
+        run: docker compose -f compose.fleet.yaml -f .github/ci/compose.fleet.apparmor.yaml --profile other-profile logs --tail 200
       - name: Stop
         if: always()
-        run: docker compose -f compose.fleet.yaml --profile other-profile down -v
+        run: docker compose -f compose.fleet.yaml -f .github/ci/compose.fleet.apparmor.yaml --profile other-profile down -v
 
   package:
     name: Release artifacts
@@ -192,6 +214,14 @@ jobs:
   deployment:
     name: Deployment verification
     runs-on: ubuntu-latest
+    env:
+      # The README's compose.yaml plus the one AppArmor opt-in this runner's
+      # Docker needs; see the file for why it is not in compose.yaml itself.
+      COMPOSE_FILE: compose.yaml:.github/ci/compose.apparmor.yaml
+      # Job level because Compose interpolates the whole file whenever it runs,
+      # including `config --images`, `logs` and `down`, and a missing token is an
+      # error there rather than an empty string.
+      SANDBOX_INTERNAL_TOKEN: ci-verification-token
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -201,14 +231,23 @@ jobs:
         run: python -m pip install uv
       - name: Install project
         run: uv sync --frozen
+      - name: Allow unprivileged user namespaces
+        # ubuntu-latest is Ubuntu 24.04, which ships
+        # kernel.apparmor_restrict_unprivileged_userns=1: a process that creates
+        # a user namespace loses its capabilities inside it, so Bubblewrap cannot
+        # write its uid map ("setting up uid map: Permission denied") and no
+        # isolation level can be negotiated. That is the host this job runs on,
+        # not something the code under test can work around; the service reports
+        # it as a preflight warning. Switching the restriction off for the
+        # duration of the job is what the sandbox's own documentation tells an
+        # operator to do on such a host.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build the base image
         # The two commands the README gives a first-time reader, in order. The
         # service image is FROM agent-sandbox-base, so `compose up` alone fails
         # on a machine that has never built it.
         run: docker build -f Dockerfile.base -t agent-sandbox-base:latest .
       - name: Start the deployment the README describes
-        env:
-          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: docker compose up -d --wait --build
       - name: Scan the image for internal markers
         # What the build context put in the image, rather than the whole
@@ -216,8 +255,6 @@ jobs:
         # produce tens of thousands of findings on their own. The script targets
         # /app and refuses to run when /app holds no application code, so a
         # "clean" answer cannot mean "looked at nothing".
-        env:
-          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: ./scripts/scan-image.sh
       - name: Prove the image scan fails on an image that carries one
         # A gate that has only ever been seen pass may be wired to nothing. This
@@ -252,8 +289,6 @@ jobs:
         # --strict so a skipped check fails: a deployment that verified half of
         # what it claims is not verified. This is also the only thing that runs
         # `examples/`, so an example cannot rot into a script that misleads.
-        env:
-          SANDBOX_INTERNAL_TOKEN: ci-verification-token
         run: uv run python scripts/verify-deployment.py --strict
       - name: Deployment logs on failure
         if: failure()

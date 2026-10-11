@@ -40,6 +40,7 @@ from agent_sandbox_runtime import (
 
 from .archive import ArchiveLimits
 from .config import Settings
+from .dormant import restore_snapshot, write_snapshot
 from .isolation_policy import negotiate_features
 from .schemas import ExecRequest, ExecResponse
 from .templates import (
@@ -78,6 +79,24 @@ class LocalSandbox:
     @property
     def workspace(self) -> Path:
         return self.root / "workspace"
+
+
+@dataclass(slots=True)
+class DormantSandbox:
+    """A suspended sandbox: its directory is kept, its capacity slot is not.
+
+    Only what a resume on this worker needs. `snapshot` records whether the
+    object store holds a copy, which is what makes the local directory safe to
+    evict under disk pressure.
+    """
+
+    sandbox_id: str
+    generation: int
+    uid: int
+    suspended_at: float
+    snapshot: bool
+    templates: tuple[TemplateRecord, ...] = ()
+    evicted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +255,8 @@ class SandboxRuntime:
         self._attached_templates: dict[str, tuple[TemplateRecord, ...]] = {}
         self._destroying: set[str] = set()
         self._destroy_tasks: dict[str, asyncio.Task[None]] = {}
+        # Suspended sandboxes. Not in `sandboxes`, so they hold no capacity slot.
+        self.dormant: dict[str, DormantSandbox] = {}
 
     async def probe(self) -> dict[str, object]:
         runtime_report = await asyncio.to_thread(self.builder.probe)
@@ -521,6 +542,10 @@ class SandboxRuntime:
                 stream.fileno(),
                 (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB,
             )
+            # A suspend unregisters the sandbox while it holds the global lock
+            # exclusively, so a call that obtained its handle earlier finds out
+            # here instead of writing into a dormant workspace.
+            self._check_not_dormant(sandbox)
             yield
         except BlockingIOError as exc:
             raise RuntimeError("SANDBOX_FILE_PATH_LOCKED") from exc
@@ -701,6 +726,13 @@ class SandboxRuntime:
                         mount_target=f"{TEMPLATE_MOUNT_ROOT}/{name}",
                     )
 
+    def _check_not_dormant(self, sandbox: LocalSandbox) -> None:
+        if sandbox.sandbox_id in self.dormant:
+            raise RuntimeError("SANDBOX_SUSPENDED")
+        current = self.sandboxes.get(sandbox.sandbox_id)
+        if current is not None and current.generation != sandbox.generation:
+            raise RuntimeError("STALE_SANDBOX_GENERATION")
+
     def _check_not_destroying(self, sandbox_id: str) -> None:
         if sandbox_id in self._destroying:
             raise RuntimeError("SANDBOX_RELEASING")
@@ -764,6 +796,7 @@ class SandboxRuntime:
     def _remove_sandbox(self, sandbox_id: str, *, delete_files: bool) -> None:
         sandbox = self.sandboxes.pop(sandbox_id, None)
         self.last_active_at.pop(sandbox_id, None)
+        self.dormant.pop(sandbox_id, None)
         # Unpin the revisions this sandbox held. Leaving them here would keep
         # every revision ever attached to this worker in the cache for as long
         # as the process lives, because pruning never evicts a pinned revision.
@@ -783,6 +816,348 @@ class SandboxRuntime:
                     # on. Wait for the delete to finish there, so a rebuilt sandbox with
                     # the same id is not removed later by the background task.
                     shutil.rmtree(root, True)
+
+    # ── suspend and resume ──
+    #
+    # A suspended sandbox keeps its directory and gives up its slot: it leaves
+    # `sandboxes`, which is what the heartbeat counts as running sessions. No
+    # process is frozen; suspend refuses while anything is running.
+
+    async def suspend(
+        self, sandbox_id: str, generation: int, *, snapshot: bool = False
+    ) -> dict[str, object]:
+        """Release the capacity slot of an idle sandbox, keeping its files.
+
+        Idempotent: suspending a sandbox that is already dormant at this
+        generation reports success and changes nothing.
+        """
+        return await complete_in_thread(self._suspend_sandbox, sandbox_id, generation, snapshot)
+
+    def _suspend_sandbox(
+        self, sandbox_id: str, generation: int, snapshot: bool
+    ) -> dict[str, object]:
+        self._check_not_destroying(sandbox_id)
+        with self._template_lock(sandbox_id):
+            self._check_not_destroying(sandbox_id)
+            sandbox = self.sandboxes.get(sandbox_id)
+            if sandbox is None:
+                dormant = self.dormant.get(sandbox_id)
+                if dormant is not None and dormant.generation == generation:
+                    return {"status": "SUSPENDED", "snapshot": dormant.snapshot}
+                raise RuntimeError("STALE_SANDBOX_GENERATION")
+            if sandbox.generation != generation:
+                raise RuntimeError("STALE_SANDBOX_GENERATION")
+            if self._has_processes(sandbox_id):
+                raise RuntimeError("SANDBOX_SUSPEND_BUSY")
+            try:
+                with self._execution_lock(sandbox, None):
+                    # Exclusive and nonblocking: any command or file call still
+                    # inside this sandbox makes the suspend fail cleanly, and
+                    # none can start until the sandbox is unregistered below.
+                    if self._has_processes(sandbox_id):
+                        raise RuntimeError("SANDBOX_SUSPEND_BUSY")
+                    store = self.templates.object_store
+                    if snapshot:
+                        if store is None:
+                            raise RuntimeError("SANDBOX_SNAPSHOT_UNAVAILABLE")
+                        write_snapshot(
+                            store,
+                            sandbox_id=sandbox_id,
+                            generation=generation,
+                            root=sandbox.root,
+                            staging_root=self._staging_root(),
+                            limits=self.templates.snapshot_limits,
+                        )
+                    self.sandboxes.pop(sandbox_id, None)
+                    self.last_active_at.pop(sandbox_id, None)
+                    self.dormant[sandbox_id] = DormantSandbox(
+                        sandbox_id=sandbox_id,
+                        generation=generation,
+                        uid=sandbox.uid,
+                        suspended_at=time.time(),
+                        snapshot=snapshot,
+                        # Kept, but not pinned: a dormant sandbox has nothing
+                        # mounted, and a resume materializes them again.
+                        templates=self._attached_templates.pop(sandbox_id, ()),
+                    )
+            except RuntimeError as exc:
+                if str(exc) in {"SANDBOX_SHARED_WORKSPACE_LOCKED", "SANDBOX_EXEC_SCOPE_LOCKED"}:
+                    raise RuntimeError("SANDBOX_SUSPEND_BUSY") from exc
+                raise
+        return {"status": "SUSPENDED", "snapshot": snapshot}
+
+    async def resume(
+        self, sandbox_id: str, generation: int, uid: int, *, restore: str = "reuse"
+    ) -> tuple[LocalSandbox, str]:
+        """Register a dormant sandbox again and return it with where its files came from.
+
+        `restore="reuse"` keeps the local directory and falls back to the
+        snapshot only when the directory is gone; `restore="snapshot"` replaces
+        whatever is local with the snapshot, which is what a sandbox moving to a
+        different worker needs. Idempotent for an already registered sandbox.
+        """
+        if restore not in {"reuse", "snapshot"}:
+            raise ValueError("restore must be 'reuse' or 'snapshot'")
+        return await complete_in_thread(self._resume_sandbox, sandbox_id, generation, uid, restore)
+
+    def _resume_sandbox(
+        self, sandbox_id: str, generation: int, uid: int, restore: str
+    ) -> tuple[LocalSandbox, str]:
+        self._check_not_destroying(sandbox_id)
+        with self._template_lock(sandbox_id):
+            self._check_not_destroying(sandbox_id)
+            existing = self.sandboxes.get(sandbox_id)
+            if existing and existing.generation == generation and existing.uid == uid:
+                self.touch(sandbox_id)
+                return existing, "active"
+            root = _sandbox_root(self.settings.workspace_root, sandbox_id)
+            source = "reused"
+            if restore == "snapshot" or not root.exists():
+                self._restore_locked(sandbox_id, uid, root)
+                source = "restored"
+            dormant = self.dormant.pop(sandbox_id, None)
+            self.sandboxes.pop(sandbox_id, None)
+            sandbox = self._create_sandbox_locked(sandbox_id, generation, uid)
+            if dormant is not None and dormant.templates:
+                self._attached_templates[sandbox_id] = dormant.templates
+            return sandbox, source
+
+    def _restore_locked(self, sandbox_id: str, uid: int, root: Path) -> None:
+        store = self.templates.object_store
+        if store is None:
+            raise RuntimeError("SANDBOX_WORKSPACE_LOST")
+        if not self.disk_status()["available"]:
+            raise RuntimeError("SANDBOX_WORKER_DISK_PRESSURE")
+        staging = self._staging_root() / f"restore-{uuid.uuid4().hex}"
+        try:
+            manifest = restore_snapshot(
+                store,
+                sandbox_id=sandbox_id,
+                destination=staging,
+                uid=uid,
+                max_extract_bytes=self.settings.template_max_extract_bytes,
+            )
+            if manifest is None:
+                raise RuntimeError("SANDBOX_WORKSPACE_LOST")
+            if root.exists():
+                # A stale local copy loses to the snapshot it predates.
+                self._move_to_trash(sandbox_id, root)
+            os.replace(staging, root)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _staging_root(self) -> Path:
+        # Beside the sandboxes, so the final rename stays on one filesystem, and
+        # under a reserved name no sandbox id can take.
+        path = self.settings.workspace_root / ".staging"
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path
+
+    def _move_to_trash(self, sandbox_id: str, root: Path) -> Path | None:
+        trash_root = self.settings.workspace_root / ".trash"
+        trash_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target = trash_root / f"{sandbox_id}-{uuid.uuid4().hex}"
+        try:
+            os.replace(root, target)
+        except OSError:
+            shutil.rmtree(root, True)
+            return None
+        return target
+
+    # ── orphaned workspace directories ──
+    #
+    # A sandbox that resumed on another worker from its snapshot, or that was
+    # released while this worker was down, leaves its directory here. Only the
+    # control plane can tell that from the metadata store, so it passes in the
+    # ids it found orphaned; this side keeps the clock and does the deletion.
+    # The clock is a marker file per directory, created the first time the
+    # directory is reported orphaned, so a restarted worker keeps counting
+    # instead of starting over, and a directory that becomes owned again (or
+    # disappears) loses its marker.
+
+    def _orphan_marker_root(self) -> Path:
+        # Beside the lifecycle locks, outside every sandbox mount, and skipped
+        # by the template cache because of the leading dot.
+        return self.settings.template_cache_root / ".orphan-workspaces"
+
+    def _owned_here(self, sandbox_id: str) -> bool:
+        # Only what runs here, or is being released here, is protected by
+        # memory. A dormant entry is not: whether a sandbox is still suspended
+        # on this worker is the route's to say, and a route released while this
+        # worker was unreachable leaves a dormant entry behind that nothing
+        # else clears. The control plane never reports a sandbox whose route
+        # still names this worker, so a sandbox suspended here is never
+        # reported orphaned.
+        return sandbox_id in self.sandboxes or sandbox_id in self._destroying
+
+    async def local_workspace_ids(self) -> list[str]:
+        """Directories under the workspace root that no live sandbox holds."""
+        return await asyncio.to_thread(self._local_workspace_ids)
+
+    def _local_workspace_ids(self) -> list[str]:
+        root = self.settings.workspace_root
+        if not root.is_dir():
+            return []
+        found: list[str] = []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name in _RESERVED_ROOT_NAMES or entry.name.startswith("."):
+                    continue
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if self._owned_here(entry.name):
+                    continue
+                found.append(entry.name)
+        return sorted(found)
+
+    async def reclaim_orphan_workspaces(
+        self, orphaned: list[str], *, ttl_seconds: int
+    ) -> list[str]:
+        """Delete the directories that have been orphaned for at least `ttl_seconds`.
+
+        `orphaned` is the full set the control plane found this cycle: a marker
+        for any id not in it is dropped, so ownership coming back resets the
+        clock. Returns the ids whose directory was deleted.
+        """
+        return await asyncio.to_thread(
+            self._reclaim_orphan_workspaces, set(orphaned), ttl_seconds, time.time()
+        )
+
+    def _reclaim_orphan_workspaces(
+        self, orphaned: set[str], ttl_seconds: int, now: float
+    ) -> list[str]:
+        markers = self._orphan_marker_root()
+        markers.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for marker in list(markers.iterdir()):
+            if marker.name not in orphaned:
+                marker.unlink(missing_ok=True)
+        removed: list[str] = []
+        for sandbox_id in sorted(orphaned):
+            try:
+                root = _sandbox_root(self.settings.workspace_root, sandbox_id)
+            except ValueError:
+                continue
+            marker = markers / sandbox_id
+            if root.is_symlink() or not root.is_dir() or self._owned_here(sandbox_id):
+                marker.unlink(missing_ok=True)
+                continue
+            try:
+                first_seen = marker.stat().st_mtime
+            except FileNotFoundError:
+                marker.touch(mode=0o600)
+                continue
+            if now - first_seen < ttl_seconds:
+                continue
+            try:
+                with self._template_lock(sandbox_id):
+                    # Re-checked under the lock every create, resume and
+                    # release takes: a sandbox that came back here meanwhile
+                    # keeps its directory.
+                    if self._owned_here(sandbox_id):
+                        marker.unlink(missing_ok=True)
+                        continue
+                    # A dormant entry for a route released or moved elsewhere
+                    # is stale; it goes with the directory.
+                    self.dormant.pop(sandbox_id, None)
+                    self._attached_templates.pop(sandbox_id, None)
+                    if root.exists() and (trashed := self._move_to_trash(sandbox_id, root)):
+                        shutil.rmtree(trashed, True)
+                    marker.unlink(missing_ok=True)
+                    removed.append(sandbox_id)
+            except RuntimeError:
+                # Busy: a create, resume or release holds the lock. Next cycle.
+                continue
+        return removed
+
+    def _has_processes(self, sandbox_id: str) -> bool:
+        return any(sid == sandbox_id for sid, _ in self.processes)
+
+    async def reclaim_dormant_disk(self) -> list[str]:
+        """Evict local copies of snapshotted dormant sandboxes under disk pressure.
+
+        Oldest first, and only while the disk is over its watermark. A sandbox
+        with no snapshot is never evicted here: its directory is the only copy,
+        and only retention expiry (a release) may delete it. An evicted sandbox
+        stays suspended; its resume restores from the snapshot.
+        """
+        evicted: list[str] = []
+        if self.disk_status()["available"]:
+            return evicted
+        candidates = sorted(
+            (item for item in self.dormant.values() if item.snapshot and not item.evicted),
+            key=lambda item: item.suspended_at,
+        )
+        for item in candidates:
+            if await asyncio.to_thread(self._evict_dormant, item.sandbox_id):
+                evicted.append(item.sandbox_id)
+                logger.info("evicted dormant workspace under disk pressure: %s", item.sandbox_id)
+            if self.disk_status()["available"]:
+                break
+        return evicted
+
+    async def adopt_dormant(
+        self,
+        sandbox_id: str,
+        *,
+        generation: int,
+        uid: int,
+        suspended_at: float,
+        snapshot: bool,
+    ) -> bool:
+        """Remember a dormant directory this process has forgotten, so disk pressure can evict it.
+
+        A restart empties `dormant`, and the directories it described stay on
+        disk. The control plane knows which suspended routes still name this
+        worker and whether their snapshot exists; this takes that back. It
+        changes no file. Returns whether the sandbox is newly remembered.
+        """
+        return await asyncio.to_thread(
+            self._adopt_dormant, sandbox_id, generation, uid, suspended_at, snapshot
+        )
+
+    def _adopt_dormant(
+        self, sandbox_id: str, generation: int, uid: int, suspended_at: float, snapshot: bool
+    ) -> bool:
+        try:
+            root = _sandbox_root(self.settings.workspace_root, sandbox_id)
+            with self._template_lock(sandbox_id):
+                if (
+                    sandbox_id in self.sandboxes
+                    or sandbox_id in self.dormant
+                    or sandbox_id in self._destroying
+                    or root.is_symlink()
+                    or not root.is_dir()
+                ):
+                    return False
+                self.dormant[sandbox_id] = DormantSandbox(
+                    sandbox_id=sandbox_id,
+                    generation=generation,
+                    uid=uid,
+                    suspended_at=suspended_at,
+                    snapshot=snapshot,
+                )
+                return True
+        except (RuntimeError, ValueError):
+            # A create, resume or release holds the lock, or the id is not a
+            # directory name: leave it to the next cycle.
+            return False
+
+    def _evict_dormant(self, sandbox_id: str) -> bool:
+        try:
+            with self._template_lock(sandbox_id):
+                item = self.dormant.get(sandbox_id)
+                if item is None or not item.snapshot or sandbox_id in self.sandboxes:
+                    return False
+                root = _sandbox_root(self.settings.workspace_root, sandbox_id)
+                if root.exists() and (trashed := self._move_to_trash(sandbox_id, root)):
+                    # Removed now rather than by the next sweep: the point is
+                    # to free the disk this cycle.
+                    shutil.rmtree(trashed, True)
+                item.evicted = True
+                return True
+        except RuntimeError:
+            # A resume or release holds the lock; it decides this sandbox.
+            return False
 
     async def shutdown(self) -> None:
         for process in list(self.processes.values()):
@@ -1019,8 +1394,11 @@ def _resolve_sandbox_path(sandbox: LocalSandbox, virtual_path: str) -> Path:
     raise ValueError(f"template source path must live under {allowed}")
 
 
+_RESERVED_ROOT_NAMES = frozenset({".trash", ".staging"})
+
+
 def _sandbox_root(workspace_root: Path, sandbox_id: str) -> Path:
-    if sandbox_id == ".trash":
+    if sandbox_id in _RESERVED_ROOT_NAMES:
         raise ValueError("sandbox id uses a reserved name")
     root = workspace_root.resolve(strict=False)
     candidate = (root / sandbox_id).resolve(strict=False)

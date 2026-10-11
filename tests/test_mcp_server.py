@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -58,6 +59,15 @@ async def _client(
             yield client
 
 
+def _deployment_verifier_tools() -> set[str]:
+    path = Path(__file__).resolve().parents[1] / "scripts" / "verify-deployment.py"
+    spec = importlib.util.spec_from_file_location("verify_deployment_tools", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return set(module.MCP_TOOLS)
+
+
 async def test_http_mcp_uses_2026_07_28_and_exposes_sandbox_toolset(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     mcp_server = app.state.mcp_server
@@ -77,8 +87,13 @@ async def test_http_mcp_uses_2026_07_28_and_exposes_sandbox_toolset(tmp_path: Pa
             "sandbox_cancel",
             "sandbox_write_file",
             "sandbox_read_file",
+            "sandbox_suspend",
+            "sandbox_resume",
             "sandbox_release",
         }
+        # The deployment verifier pins the same toolset and fails a real
+        # deployment on any difference, so the two lists move together.
+        assert {tool.name for tool in tools.tools} == _deployment_verifier_tools()
 
         result = await client.call_tool("sandbox_profile", {})
         assert result.is_error is False

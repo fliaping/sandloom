@@ -23,8 +23,29 @@ chain. Object storage holds archives rather than filesystem calls: environment
 templates, and checkpoint archives a caller keeps. `BlobStore.upload_checkpoint(sandbox_id, archive)`
 names one at `checkpoints/<sandbox_id>/<archive name>` and returns the URI that
 `get`/`download_to`/`delete` address it by, which is the whole of what this
-project does about checkpoints — it does not snapshot or restore a workspace for
-you. See [Architecture](ARCHITECTURE.md).
+project does about caller checkpoints — it does not snapshot or restore a running
+workspace for you. Suspend is the one exception: it archives a dormant workspace
+under `checkpoints/<sandbox_id>/dormant/` so a resume can land on another worker
+([Suspend and resume](SUSPEND_RESUME.md)). A metadata store opts in to suspend by
+implementing `DormantRouteStore`, and an execution backend by implementing
+`DormantLifecycle`; without them the API answers 501
+`SANDBOX_SUSPEND_UNSUPPORTED`. See [Architecture](ARCHITECTURE.md).
+
+### S3-compatible stores
+
+The adapter speaks plain S3 with path-style addressing and signature v4, so any
+compatible store works. Two have been run against it end to end: LocalStack and
+RustFS (`rustfs/rustfs`). RustFS needs its access-key and secret-key
+variables set, a data directory writable by UID 10001, and its API port
+(9000) as `BLOBSTORE_ENDPOINT`; the bucket does not need to exist, because the
+workers create it at startup. Against RustFS, the following behaved exactly as
+against AWS S3 and needed no change: put/get/head/delete, deleting a missing key
+(204), a multipart upload of a 20 MB object (ETag `<hash>-<parts>`), listing with
+continuation across pages and past 1,000 keys, presigned GET and PUT,
+`If-None-Match: *` (a second write answers 412), a mismatched client region,
+default and `when_required` boto3 checksum modes, and a wrong secret (403).
+Virtual-host addressing was not exercised, because the endpoint was an IP
+address.
 
 ## Plugin discovery
 

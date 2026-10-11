@@ -6,11 +6,33 @@ from pathlib import Path
 
 import pytest
 
+from agent_sandbox import preflight
 from agent_sandbox.config import Settings
 from agent_sandbox.preflight import (
+    check_user_namespace_support,
     toolchain_isolation_warnings,
     validate_runtime_environment,
 )
+
+
+@pytest.fixture(autouse=True)
+def host_allows_user_namespaces(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Make the preflight tests independent of the kernel they run on.
+
+    `validate_runtime_environment` also reports the host's user-namespace
+    settings, so on a machine with `kernel.apparmor_restrict_unprivileged_userns=1`
+    (GitHub's hosted runners, Ubuntu 24.04) every exact-list assertion below
+    gained a warning that has nothing to do with what it tests. The probe has its
+    own tests, which opt out of this fixture.
+    """
+    if request.node.get_closest_marker("real_host_probe"):
+        return
+    sysctl = tmp_path / "apparmor_restrict_unprivileged_userns"
+    sysctl.write_text("0\n", encoding="utf-8")
+    monkeypatch.setattr(preflight, "_APPARMOR_USERNS_SYSCTL", sysctl)
+    monkeypatch.setattr(preflight, "_has_bounding_capability", lambda _capability: True)
 
 
 def _executable(path: Path) -> Path:
@@ -264,3 +286,31 @@ def test_an_empty_token_in_production_stops_startup(
 
     with pytest.raises(RuntimeError, match="SANDBOX_INTERNAL_TOKEN is not configured"):
         validate_runtime_environment(settings)
+
+
+@pytest.mark.real_host_probe
+@pytest.mark.parametrize(("content", "warns"), [("1\n", True), ("0\n", False), (None, False)])
+def test_the_apparmor_userns_restriction_is_reported_only_when_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str | None, warns: bool
+) -> None:
+    sysctl = tmp_path / "apparmor_restrict_unprivileged_userns"
+    if content is not None:
+        sysctl.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(preflight, "_APPARMOR_USERNS_SYSCTL", sysctl)
+    monkeypatch.setattr(preflight, "_has_bounding_capability", lambda _capability: True)
+    monkeypatch.setattr(preflight.sys, "platform", "linux")
+
+    found = check_user_namespace_support()
+
+    assert bool(found) is warns
+    if warns:
+        assert "apparmor_restrict_unprivileged_userns=1" in found[0]
+
+
+@pytest.mark.real_host_probe
+def test_a_root_caller_without_cap_setfcap_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(preflight.sys, "platform", "linux")
+    monkeypatch.setattr(preflight.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(preflight, "_has_bounding_capability", lambda _capability: False)
+
+    assert any("CAP_SETFCAP" in warning for warning in check_user_namespace_support())

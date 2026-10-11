@@ -80,6 +80,7 @@ def test_stat_open_races_never_read_replacement(
         if path == "data" and kwargs.get("dir_fd") is not None and not changed:
             changed = True
             target = source / "data"
+            original = target.stat() if not target.is_dir() else None
             if target.is_dir():
                 target.rename(source / "old")
                 target.symlink_to(tmp_path, target_is_directory=True)
@@ -89,6 +90,17 @@ def test_stat_open_races_never_read_replacement(
                     os.mkfifo(target)
                 elif kind == "file-replacement":
                     target.write_text("host secret")
+                    # The replacement is the same size as the original and a
+                    # filesystem hands a just-freed inode straight back, so
+                    # without this the two files can agree on inode, size and
+                    # (the clock ticks in milliseconds) both timestamps, and
+                    # nothing could tell them apart. A real replacement is
+                    # written at another time; say so, so the test is about the
+                    # check and not about the timer.
+                    assert original is not None
+                    os.utime(
+                        target, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000_000)
+                    )
                 else:
                     target.symlink_to(host)
         return original_open(path, flags, *args, **kwargs)

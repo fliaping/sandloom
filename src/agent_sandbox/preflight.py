@@ -140,6 +140,9 @@ def validate_runtime_environment(settings: Settings) -> list[str]:
     return warnings
 
 
+_APPARMOR_USERNS_SYSCTL = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+
+
 def check_user_namespace_support() -> list[str]:
     """Report host settings that break Bubblewrap in ways that are hard to read.
 
@@ -164,9 +167,8 @@ def check_user_namespace_support() -> list[str]:
         return []
 
     warnings: list[str] = []
-    restrict = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     try:
-        if restrict.read_text(encoding="utf-8").strip() == "1":
+        if _APPARMOR_USERNS_SYSCTL.read_text(encoding="utf-8").strip() == "1":
             warnings.append(
                 "kernel.apparmor_restrict_unprivileged_userns=1 strips capabilities from new "
                 "user namespaces; Bubblewrap probes may fail with 'Operation not permitted'"
