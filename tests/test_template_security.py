@@ -474,10 +474,7 @@ async def test_release_terminates_execution_before_draining_its_lock(
             await destruction
 
 
-async def test_strict_does_not_advertise_aggregate_quotas(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    runtime, _ = await runtime_and_sandbox(tmp_path)
+def _fake_probe(runtime: SandboxRuntime, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runtime.builder, "probe", lambda: {})
 
     async def supported(*args: Any) -> tuple[bool, str]:
@@ -489,21 +486,77 @@ async def test_strict_does_not_advertise_aggregate_quotas(
         return {}
 
     monkeypatch.setattr("agent_sandbox.runtime.probe_toolchains", measured_launch)
+
+
+async def test_without_cgroups_strict_is_unavailable_and_rlimits_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _ = await runtime_and_sandbox(tmp_path)
+    _fake_probe(runtime, monkeypatch)
+    monkeypatch.setattr(runtime, "_setup_cgroups", lambda: None)
+    monkeypatch.setattr("agent_sandbox.runtime.can_read_foreign_io", lambda *a: True)
     report = await runtime.probe()
+    # strict promises aggregate limits, so it is not selected without them.
+    assert report["selected_level"] == "standard"
+    assert "resource limits" in report["probe_failures"]["strict"]
+    control = report["resource_control"]
+    assert control["scheme"] == "rlimit+supervisor"
+    # Aggregate limits still hold, enforced by the supervisor, and say so.
+    assert control["sandbox_cpu_quota"] is True
+    assert control["sandbox_memory_quota"] is True
+    assert control["enforcement"]["memory"].startswith("supervised")
+    assert control["enforcement"]["cpu"].startswith("supervised")
+    assert control["enforcement"]["pids"].startswith("kernel (RLIMIT_NPROC")
+    assert control["sandbox_pid_quota"] is True
+    assert control["sandbox_disk_quota"] is True
+    assert control["sandbox_io_limit"] is True
+    assert control["enforcement"]["io"].startswith("supervised")
+    assert control["execution_cgroup_supervision"] is False
+    assert runtime.supervisor.memory_bytes == 2 * 1024**3
+    assert control["limits"]["address_space_bytes_per_process"] == 8 * 1024**3
+    assert control["limits"]["wall_clock_seconds_per_exec_default"] == 300
+    assert control["process_limits"]["processes_per_real_uid"] == 64
+    assert runtime.builder.profile.max_address_space_bytes == 8 * 1024**3
+
+
+async def test_with_cgroups_strict_reports_aggregate_quotas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _ = await runtime_and_sandbox(tmp_path)
+    _fake_probe(runtime, monkeypatch)
+
+    def active() -> None:
+        runtime.cgroups.active = True
+
+    monkeypatch.setattr(runtime, "_setup_cgroups", active)
+    monkeypatch.setattr(runtime.cgroups, "remove_sandbox", lambda sandbox_id: None)
+    report = await runtime.probe()
+    assert report["selected_level"] == "strict"
     assert report["cgroup_namespace"] is True
-    assert report["resource_control"] == {
-        "process_limits": {
-            "cpu_seconds_per_process": 300,
-            "processes_per_real_uid": 64,
-            "open_files_per_process": 512,
-            "bytes_per_file": 1024 * 1024 * 1024,
-        },
-        "sandbox_cpu_quota": False,
-        "sandbox_memory_quota": False,
-        "sandbox_pid_quota": False,
-        "sandbox_disk_quota": False,
-        "execution_cgroup_supervision": False,
-    }
+    control = report["resource_control"]
+    assert control["scheme"] == "cgroup_v2"
+    assert control["sandbox_cpu_quota"] is True
+    assert control["sandbox_memory_quota"] is True
+    assert control["sandbox_pid_quota"] is True
+    assert control["sandbox_disk_quota"] is True
+    assert control["enforcement"]["memory"] == "kernel (cgroup v2)"
+    # The kernel enforces memory and CPU; the supervisor only watches disk.
+    assert runtime.supervisor.memory_bytes is None
+    assert control["limits"]["memory_bytes_per_sandbox"] == 2 * 1024**3
+    assert control["limits"]["address_space_bytes_per_process"] is None
+    # The aggregate cgroup limit replaces RLIMIT_AS, which breaks JIT runtimes.
+    assert runtime.builder.profile.max_address_space_bytes is None
+
+
+async def test_required_cgroup_mode_refuses_to_start_without_delegation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = SandboxRuntime(
+        Settings(internal_token="token", local_root=tmp_path, cgroup_mode="required")
+    )
+    runtime.cgroups.mount = tmp_path / "not-a-cgroup"
+    with pytest.raises(RuntimeError, match="SANDBOX_CGROUP_UNAVAILABLE"):
+        await runtime.probe()
 
 
 @pytest.mark.parametrize(

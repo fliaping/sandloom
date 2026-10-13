@@ -190,3 +190,19 @@ notice.
 
 Every enabled language it cannot check is reported as SKIP with the reason, and
 `--strict` turns a SKIP into a failure so a partial run cannot pass quietly.
+
+## JVM heap follows the sandbox memory limit
+
+Below `strict` the JVM cannot see a cgroup of its own, so it sizes its default
+heap from the host's RAM: a quarter of it, which can be far larger than the
+sandbox memory limit. The image's Java launchers therefore start every JVM
+with `-XX:MaxRAM=<SANDBOX_MEMORY_LIMIT_BYTES>`, and every JDK tool with
+`-J-XX:MaxRAM=…`. This applies at every level and under both resource
+schemes. The flag goes first on the command line, so anything the user
+passes (`-Xmx`, `-XX:MaxRAM`, `-XX:MaxRAMPercentage`) still wins. Maven and
+Gradle reach the same launchers through `JAVA_HOME`.
+
+The launchers do not use `JAVA_TOOL_OPTIONS` or `JDK_JAVA_OPTIONS`, because
+both print a "Picked up …" note to stderr and that breaks tools that parse
+stderr. Set `SANDBOX_JVM_MAX_RAM_FROM_LIMIT=false` to turn this off. A
+system JDK without these launchers is not adjusted.

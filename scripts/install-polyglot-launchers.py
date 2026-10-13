@@ -23,6 +23,42 @@ def _library_path(directory: Path) -> str:
     return f"export LD_LIBRARY_PATH={shlex.quote(str(directory))}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\n"
 
 
+# JDK tools that take JVM options through -J. `java` takes them directly.
+_J_OPTION_TOOLS = frozenset(
+    {
+        "javac",
+        "jar",
+        "jarsigner",
+        "javadoc",
+        "jdeps",
+        "jlink",
+        "jmod",
+        "jpackage",
+        "jshell",
+        "keytool",
+        "jdb",
+    }
+)
+
+
+def _jvm_memory(name: str) -> str:
+    """Size the JVM from the sandbox's memory limit, not the host's RAM.
+
+    Without a cgroup namespace the JVM sees the whole host and picks a default
+    heap of a quarter of it, far above the sandbox limit. The runtime exports
+    SANDBOX_JVM_MAX_RAM; it goes first so any flag the user passes later
+    (-Xmx, -XX:MaxRAM, -XX:MaxRAMPercentage) still wins. This is quiet, unlike
+    JAVA_TOOL_OPTIONS and JDK_JAVA_OPTIONS, which print a note to stderr.
+    """
+    if name == "java":
+        flag = '-XX:MaxRAM="$SANDBOX_JVM_MAX_RAM"'
+    elif name in _J_OPTION_TOOLS:
+        flag = '-J-XX:MaxRAM="$SANDBOX_JVM_MAX_RAM"'
+    else:
+        return ""
+    return f'if [ -n "${{SANDBOX_JVM_MAX_RAM:-}}" ]; then set -- {flag} "$@"; fi\n'
+
+
 def install_java(java_home: Path, destination: Path) -> None:
     """Expose a JDK-shaped JAVA_HOME, including wrappers for every JDK tool."""
     java_home = java_home.resolve(strict=True)
@@ -36,7 +72,9 @@ def install_java(java_home: Path, destination: Path) -> None:
         if binary.is_file() and os.access(binary, os.X_OK):
             _launcher(
                 destination / "bin" / binary.name,
-                _library_path(java_home / "lib") + f'exec {shlex.quote(str(binary))} "$@"\n',
+                _library_path(java_home / "lib")
+                + _jvm_memory(binary.name)
+                + f'exec {shlex.quote(str(binary))} "$@"\n',
             )
 
 

@@ -235,7 +235,10 @@ def rust_toolchain(
 
 
 def java_toolchain(
-    *, maven_repository_url: str | None = None, java_home: str | None = None
+    *,
+    maven_repository_url: str | None = None,
+    java_home: str | None = None,
+    jvm_max_ram_bytes: int | None = None,
 ) -> Toolchain:
     """JVM languages with Maven and Gradle.
 
@@ -252,6 +255,9 @@ def java_toolchain(
         environment["MAVEN_MIRROR_URL"] = maven_repository_url
     if java_home:
         environment["JAVA_HOME"] = java_home
+    if jvm_max_ram_bytes:
+        # Read by the image-owned launchers, which pass -XX:MaxRAM.
+        environment["SANDBOX_JVM_MAX_RAM"] = str(jvm_max_ram_bytes)
     return Toolchain(
         name="java",
         environment=environment,
@@ -259,7 +265,13 @@ def java_toolchain(
             f"{ENVS_ROOT}/java/bin",
             *((f"{java_home}/bin",) if java_home else ()),
         ),
-        reserved_names=("MAVEN_OPTS", "GRADLE_USER_HOME", "SBT_OPTS", "MAVEN_MIRROR_URL"),
+        reserved_names=(
+            "MAVEN_OPTS",
+            "GRADLE_USER_HOME",
+            "SBT_OPTS",
+            "MAVEN_MIRROR_URL",
+            "SANDBOX_JVM_MAX_RAM",
+        ),
         needs_procfs=java_home is None,
         reserved_prefixes=("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "CLASSPATH"),
     )

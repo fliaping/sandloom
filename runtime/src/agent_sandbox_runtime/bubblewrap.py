@@ -141,6 +141,9 @@ class BubblewrapCommandBuilder:
             args.append(f"--cpu={profile.cpu_seconds}:{profile.cpu_seconds}")
         if profile.max_processes is not None:
             args.append(f"--nproc={profile.max_processes}:{profile.max_processes}")
+        if profile.max_address_space_bytes is not None:
+            limit = profile.max_address_space_bytes
+            args.append(f"--as={limit}:{limit}")
         args.extend(
             [
                 f"--nofile={profile.max_open_files}:{profile.max_open_files}",

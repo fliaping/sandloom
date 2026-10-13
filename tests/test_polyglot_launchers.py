@@ -139,3 +139,48 @@ def test_rust_override_is_refused_explicitly(tmp_path: Path, installer: ModuleTy
     assert result.returncode == 2
     assert "RUST_VERSION" in result.stderr
     assert "should-not-run" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("tool", "flag"),
+    [("java", "-XX:MaxRAM=402653184"), ("javac", "-J-XX:MaxRAM=402653184")],
+)
+def test_java_launchers_size_the_jvm_from_the_sandbox_limit(
+    tmp_path: Path, installer: ModuleType, tool: str, flag: str
+) -> None:
+    home = tmp_path / "jdk"
+    (home / "lib").mkdir(parents=True)
+    (home / "lib" / "libjli.so").touch()
+    executable(home / "bin" / tool, 'printf "%s\\n" "$@"\n')
+    executable(home / "bin" / "jfr", 'printf "%s\\n" "$@"\n')
+    installer.install_java(home, tmp_path / "facade")
+
+    def run(name: str, *args: str, limit: str | None = "402653184") -> list[str]:
+        env = {k: v for k, v in os.environ.items() if k != "SANDBOX_JVM_MAX_RAM"}
+        if limit is not None:
+            env["SANDBOX_JVM_MAX_RAM"] = limit
+        result = subprocess.run(
+            [str(tmp_path / "facade" / "bin" / name), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stderr == ""
+        return result.stdout.splitlines()
+
+    # First, so a user's -Xmx or -XX:MaxRAM later on the command line wins.
+    assert run(tool, "-Xmx64m", "Main") == [flag, "-Xmx64m", "Main"]
+    assert run(tool, "Main", limit=None) == ["Main"]
+    assert run(tool, "Main", limit="") == ["Main"]
+    # A tool that takes no -J options is left alone.
+    assert run("jfr", "summary") == ["summary"]
+
+
+def test_java_toolchain_exports_the_limit_and_reserves_it() -> None:
+    from agent_sandbox_runtime.toolchains import java_toolchain
+
+    toolchain = java_toolchain(java_home="/jdk", jvm_max_ram_bytes=1024)
+    assert toolchain.environment["SANDBOX_JVM_MAX_RAM"] == "1024"
+    assert "SANDBOX_JVM_MAX_RAM" in toolchain.reserved_names
+    assert "SANDBOX_JVM_MAX_RAM" not in java_toolchain(java_home="/jdk").environment
