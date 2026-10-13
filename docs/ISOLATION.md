@@ -151,12 +151,74 @@ Choose the Level and other policies for the workload:
 | Agents needing process privacy or reliable PID-namespace teardown | Require `standard` or above; keep network and resource policy choices explicit. |
 | Hostile public tenants | A namespace Level alone, including `strict`, is insufficient. Require suitable enforced aggregate budgets/process supervision and a network boundary (no network or mandatory selective enforcement), or a stronger execution backend such as a VM. |
 
-`/healthz` reports `resource_control` separately from `cgroup_namespace`:
-the built-in backend advertises configured per-process/UID/file limits, but
-`sandbox_cpu_quota`, `sandbox_memory_quota`, `sandbox_pid_quota`,
-`sandbox_disk_quota`, and `execution_cgroup_supervision` are all `false`.
-An enforcing plugin must report its actual controls, not infer them from
-the Level's name. See [Hardening](HARDENING.md) for conditional enhancements.
+`/healthz` reports `resource_control` separately from `cgroup_namespace`.
+It states the scheme actually enforced (`cgroup_v2` or `rlimit`), and
+`sandbox_cpu_quota`, `sandbox_memory_quota`, `sandbox_pid_quota` and
+`execution_cgroup_supervision` are `true` only when the worker created and
+manages the cgroups. `sandbox_disk_quota` is always `false`. An enforcing
+plugin must report its actual controls, not infer them from the Level's name.
+See [Hardening](HARDENING.md) for conditional enhancements.
+
+## Resource limits by level
+
+The resource scheme follows the isolation level and what the outer runtime
+permits. It is negotiated at startup like the level itself, and `/healthz`
+reports the result under `resource_control`.
+
+| Level | cgroup v2 manageable (default `SANDBOX_CGROUP_MODE=auto`) | No cgroup v2 (or `SANDBOX_CGROUP_MODE=off`) |
+| --- | --- | --- |
+| `basic` | **cgroup scheme**: per sandbox `cpu.max` (`SANDBOX_CPU_QUOTA`, 2 cores), `memory.max` (`SANDBOX_MEMORY_LIMIT_BYTES`, 2 GiB) with `memory.swap.max=0`, `pids.max` (`SANDBOX_PIDS_LIMIT`, 512); one leaf per execution with `memory.oom.group=1`, killed and removed when the execution ends; worker reserve. Plus every rlimit except `RLIMIT_AS`. | **rlimit scheme**: per process `RLIMIT_AS` (`SANDBOX_ADDRESS_SPACE_LIMIT_BYTES`, 8 GiB), `RLIMIT_CPU` (`SANDBOX_CPU_SECONDS`), per UID `RLIMIT_NPROC` (`SANDBOX_MAX_PROCESSES`), `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, no core dumps; the per-execution wall-clock timeout; leftover processes of the sandbox UID killed after the last execution ends. No aggregate CPU or memory bound. |
+| `standard` | Same cgroup scheme. | Same rlimit scheme. The PID namespace additionally ends every process of an execution with it. |
+| `strict` | Same cgroup scheme, plus the cgroup namespace. | **Not available.** `strict` promises aggregate limits, so `auto` selects `standard` and an explicit `SANDBOX_ISOLATION_LEVEL=strict` refuses to start (`resource limits: …` in `probe_failures`). |
+
+`SANDBOX_CGROUP_MODE=required` refuses to start at any level without cgroups
+(`SANDBOX_CGROUP_UNAVAILABLE`). Use it, or `strict`, wherever untrusted code
+runs: the rlimit scheme bounds each process, not the sandbox, so N processes
+can still use N × `RLIMIT_AS` and every core.
+
+What a runaway command gets:
+
+| Event | cgroup scheme | rlimit scheme |
+| --- | --- | --- |
+| Memory over the limit | The execution's process tree is OOM-killed together; the response is `status=OOM_KILLED`, `error_code=SANDBOX_MEMORY_LIMIT_EXCEEDED`. Other sandboxes and the worker are unaffected. | The allocating process gets `ENOMEM` (`MemoryError` in Python); `status=FAILED`. |
+| Fork bomb | `pids.max` stops it; `error_code=SANDBOX_PIDS_LIMIT_REACHED` when the limit was hit. | `RLIMIT_NPROC` per sandbox UID stops it; the timeout ends it. |
+| CPU spin on many cores | Throttled to `SANDBOX_CPU_QUOTA` cores in total. | Not bounded beyond `RLIMIT_CPU` per process and the timeout. |
+| Leftover background process | Killed with the execution's cgroup (`cgroup.kill`). | Killed when no other execution of the sandbox runs. |
+
+Release and suspend kill the sandbox cgroup and remove it; a dormant sandbox
+holds none. The worker moves itself into a `worker` leaf with `memory.min` set
+to `SANDBOX_WORKER_MEMORY_RESERVE_BYTES` (256 MiB), and caps the aggregate of
+all sandboxes at the container's memory limit minus that reserve, so the
+container never reaches its own limit because of a sandbox.
+
+### Outer runtime requirements for the cgroup scheme
+
+The worker needs a cgroup v2 hierarchy, the `cpu`, `memory` and `pids`
+controllers delegated to its own cgroup, and a private cgroup namespace:
+
+- **Docker / Compose**: cgroup v2 hosts give containers a private cgroup
+  namespace by default (`cgroupns: private`). Docker mounts it read-only; the
+  worker then mounts a fresh cgroup2 from a user namespace it creates
+  (`unshare --user --map-root-user --mount --cgroup`), which the kernel makes
+  read-write and rooted at the container's own cgroup. This needs nothing
+  beyond the `seccomp=unconfined` the Compose files already set: no
+  capabilities, no privileged mode, no host cgroup mount. Set a container
+  memory limit (`mem_limit` / `--memory`) so the reserve has a ceiling to
+  subtract from.
+- **Hosts that restrict unprivileged user namespaces** (Ubuntu 23.10+ AppArmor,
+  `kernel.apparmor_restrict_unprivileged_userns=1`) block that mount as they
+  block Bubblewrap; the same override from the AppArmor section above
+  applies. Otherwise `auto` falls back to the rlimit scheme and says why in
+  `resource_control.cgroup.detail`.
+- **cgroup v1 hosts, `cgroupns: host`** without a writable delegated subtree,
+  and runtimes that forbid user namespaces: rlimit scheme only.
+- **Kubernetes**: the same mechanism works where the pod may create user
+  namespaces (the seccomp profile allows `unshare`/`mount`); give the pod a
+  memory limit. Verify with `/healthz` on the target cluster.
+
+The sandbox UIDs cannot change their own limits: cgroup files are owned by the
+worker's root, and the helper mount is not visible inside the Bubblewrap mount
+namespace.
 
 ## Selection
 

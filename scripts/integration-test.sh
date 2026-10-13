@@ -73,7 +73,8 @@ run_sandbox_tests() {
     "${TEST_IMAGE}" \
     uv run --no-sync pytest \
       tests/integration/test_bubblewrap_isolation.py \
-      tests/integration/test_template_isolation.py -v "$@"
+      tests/integration/test_template_isolation.py \
+      tests/integration/test_resource_limits.py -v "$@"
 }
 
 run_polyglot_tests() {

@@ -172,6 +172,9 @@ class ExecResponse(BaseModel):
     stderr: str = ""
     duration_ms: int | None = None
     truncated: bool = False
+    # Set when a resource limit ended the command, e.g.
+    # SANDBOX_MEMORY_LIMIT_EXCEEDED or SANDBOX_PIDS_LIMIT_REACHED.
+    error_code: str | None = None
 
 
 class FileWriteRequest(BaseModel):

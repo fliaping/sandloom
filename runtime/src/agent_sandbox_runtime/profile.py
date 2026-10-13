@@ -28,6 +28,7 @@ class SandboxRuntimeProfile:
     max_processes: int | None = 64
     max_open_files: int = 512
     max_file_size_bytes: int = 1024 * 1024 * 1024
+    max_address_space_bytes: int | None = None
     readonly_mounts: tuple[str, ...] = (
         "/usr",
         "/bin",
@@ -56,6 +57,8 @@ class SandboxRuntimeProfile:
                 raise ValueError(f"Sandbox {name} must be positive")
         if self.cpu_seconds is not None and self.cpu_seconds < 1:
             raise ValueError("Sandbox cpu_seconds must be positive")
+        if self.max_address_space_bytes is not None and self.max_address_space_bytes < 1:
+            raise ValueError("Sandbox max_address_space_bytes must be positive")
         if self.max_processes is not None and self.max_processes < 1:
             raise ValueError("Sandbox max_processes must be positive")
 

@@ -69,6 +69,12 @@ profile identity.
 | `SANDBOX_TMPFS_BYTES` | `536870912` (512 MiB) | Size of the sandbox's private tmpfs. |
 | `SANDBOX_CPU_SECONDS` | `300` | CPU seconds per process (`RLIMIT_CPU`), not a shared sandbox CPU quota or wall-clock deadline. |
 | `SANDBOX_MAX_PROCESSES` | `64` | `RLIMIT_NPROC` counts processes/threads for the real UID, subject to OS privilege semantics; not an execution-scoped cgroup PID budget. See `SANDBOX_TOOLCHAINS` for Go's compiler limits. |
+| `SANDBOX_CGROUP_MODE` | `auto` | Per-sandbox cgroup v2 limits: `auto` uses them when the worker can manage a delegated cgroup and otherwise falls back to rlimits, `required` refuses to start without them, `off` never uses them. The `strict` level is only selectable with cgroups active. See [ISOLATION.md](ISOLATION.md#resource-limits-by-level). |
+| `SANDBOX_CPU_QUOTA` | `2.0` | CPU cores per sandbox (`cpu.max`), shared by every command in it. `0` leaves CPU unlimited. cgroup scheme only. |
+| `SANDBOX_MEMORY_LIMIT_BYTES` | `2147483648` | Memory per sandbox (`memory.max`, with `memory.swap.max=0`); a command over it is OOM-killed as a group and returns `OOM_KILLED` / `SANDBOX_MEMORY_LIMIT_EXCEEDED`. `0` leaves it unlimited. cgroup scheme only. |
+| `SANDBOX_PIDS_LIMIT` | `512` | Processes and threads per sandbox (`pids.max`). `0` leaves it unlimited. cgroup scheme only. |
+| `SANDBOX_WORKER_MEMORY_RESERVE_BYTES` | `268435456` | Memory kept for the worker's control process: set as `memory.min` on its leaf and subtracted from the sandboxes' aggregate `memory.max`. cgroup scheme only. |
+| `SANDBOX_ADDRESS_SPACE_LIMIT_BYTES` | `8589934592` | Fallback per-process `RLIMIT_AS`, applied only when cgroups are not active. Larger than the memory limit because Node and the JVM reserve address space they never use. `0` disables it. |
 | `SANDBOX_MAX_OPEN_FILES` | `512` | Open descriptors per process (`RLIMIT_NOFILE`), not per sandbox. |
 | `SANDBOX_MAX_FILE_SIZE_BYTES` | `1073741824` (1 GiB) | Largest individual file (`RLIMIT_FSIZE`), not an aggregate disk quota. |
 | `SANDBOX_READONLY_MOUNTS` | `/usr,/bin,/sbin,/lib,/lib64,/etc` | Host trees mounted read-only into every sandbox. |

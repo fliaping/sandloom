@@ -1,4 +1,4 @@
-"""Isolated UID + prlimit + Bubblewrap execution layer."""
+"""Isolated UID + cgroup v2/prlimit + Bubblewrap execution layer."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -39,6 +40,7 @@ from agent_sandbox_runtime import (
 )
 
 from .archive import ArchiveLimits
+from .cgroups import CgroupLimits, CgroupManager, CgroupUnavailable, placement_prefix
 from .config import Settings
 from .dormant import restore_snapshot, write_snapshot
 from .isolation_policy import negotiate_features
@@ -126,8 +128,10 @@ class BubblewrapCommandBuilder:
         isolation_level: IsolationLevel = IsolationLevel.BASIC,
         additional_features: tuple[str, ...] = (),
         extension: RuntimeExtension | None = None,
+        rlimit_memory: bool = True,
     ) -> None:
         self.settings = settings
+        self.rlimit_memory = rlimit_memory
         self.disable_nested_userns = disable_nested_userns
         self.isolation_level = isolation_level
         self.extension = extension or RuntimeExtension()
@@ -136,6 +140,7 @@ class BubblewrapCommandBuilder:
             disable_nested_userns=disable_nested_userns,
             isolation_level=isolation_level,
             additional_features=additional_features,
+            rlimit_memory=rlimit_memory,
         )
         self.profile = profile
         self._shared = InteractiveSandboxCommandBuilder(
@@ -257,8 +262,34 @@ class SandboxRuntime:
         self._destroy_tasks: dict[str, asyncio.Task[None]] = {}
         # Suspended sandboxes. Not in `sandboxes`, so they hold no capacity slot.
         self.dormant: dict[str, DormantSandbox] = {}
+        self.cgroups = CgroupManager(
+            CgroupLimits(
+                cpu_cores=settings.cpu_quota or None,
+                memory_bytes=settings.memory_limit_bytes or None,
+                pids=settings.pids_limit or None,
+                worker_memory_reserve_bytes=settings.worker_memory_reserve_bytes,
+            )
+        )
+        self.cgroups.detail = "disabled by SANDBOX_CGROUP_MODE=off"
+        self._exec_cgroups: dict[tuple[str, str], Path] = {}
+
+    def _setup_cgroups(self) -> None:
+        if self.settings.cgroup_mode == "off":
+            return
+        try:
+            self.cgroups.setup()
+        except CgroupUnavailable as exc:
+            if self.settings.cgroup_mode == "required":
+                raise RuntimeError(f"SANDBOX_CGROUP_UNAVAILABLE: {exc}") from exc
+            logger.warning("%s; falling back to per-process rlimits", exc)
+
+    @property
+    def cgroup_active(self) -> bool:
+        return self.cgroups.active
 
     async def probe(self) -> dict[str, object]:
+        await asyncio.to_thread(self._setup_cgroups)
+        rlimit_memory = not self.cgroup_active
         runtime_report = await asyncio.to_thread(self.builder.probe)
         probe_root = self.settings.workspace_root / f".probe-{uuid.uuid4().hex}"
         probe_id = probe_root.name
@@ -291,6 +322,7 @@ class SandboxRuntime:
                         disable_nested_userns=disable_nested_userns,
                         isolation_level=level,
                         extension=self.extension,
+                        rlimit_memory=rlimit_memory,
                     )
                     ok, detail = await self._probe_candidate(
                         candidate,
@@ -304,15 +336,18 @@ class SandboxRuntime:
                     failures.append(f"disable_nested_userns={disable_nested_userns}: {detail}")
                 else:
                     results[level] = (False, " | ".join(failures))
+                if level.label == "strict" and results[level][0] and not self.cgroup_active:
+                    # strict promises aggregate resource limits as well as a
+                    # cgroup namespace; without delegation it cannot keep that.
+                    results[level] = (False, f"resource limits: {self.cgroups.detail}")
+                    candidates.pop(level, None)
 
             selection = negotiate_isolation(
                 self.settings.isolation_level,
                 lambda level: results[level],
             )
             self.builder = candidates[selection.selected]
-            feature_candidates: dict[tuple[str, ...], BubblewrapCommandBuilder] = {
-                (): self.builder
-            }
+            feature_candidates: dict[tuple[str, ...], BubblewrapCommandBuilder] = {(): self.builder}
 
             async def probe_features(features: tuple[str, ...]) -> tuple[bool, str]:
                 failures = []
@@ -323,6 +358,7 @@ class SandboxRuntime:
                         additional_features=features,
                         disable_nested_userns=disable_nested,
                         extension=self.extension,
+                        rlimit_memory=rlimit_memory,
                     )
                     ok, detail = await self._probe_candidate(
                         candidate,
@@ -357,6 +393,7 @@ class SandboxRuntime:
         finally:
             self.sandboxes.pop(probe_id, None)
             self.last_active_at.pop(probe_id, None)
+            await asyncio.to_thread(self.cgroups.remove_sandbox, probe_id)
             await asyncio.to_thread(shutil.rmtree, probe_root, True)
         toolchains = self.builder.toolchains
         return {
@@ -380,9 +417,7 @@ class SandboxRuntime:
                     for name in toolchains_unavailable_at(actual_features, toolchains)
                     if checks.get(name, {}).get("status") in {"failed", "timed_out"}
                 ),
-                "isolation_hints": list(
-                    toolchains_unavailable_at(actual_features, toolchains)
-                ),
+                "isolation_hints": list(toolchains_unavailable_at(actual_features, toolchains)),
                 "checks": checks,
                 "available": [
                     name for name, check in checks.items() if check["status"] == "available"
@@ -405,14 +440,38 @@ class SandboxRuntime:
                     "open_files_per_process": self.settings.max_open_files,
                     "bytes_per_file": self.settings.max_file_size_bytes,
                 },
-                "sandbox_cpu_quota": False,
-                "sandbox_memory_quota": False,
-                "sandbox_pid_quota": False,
+                **self._resource_report(selection.selected.label),
                 "sandbox_disk_quota": False,
-                "execution_cgroup_supervision": False,
             },
             "landlock": False,
             "extension": dict(self.extension.capability_labels),
+        }
+
+    def _resource_report(self, level: str) -> dict[str, object]:
+        cg = self.cgroup_active
+        settings = self.settings
+        rlimit_as = (not cg) and bool(settings.address_space_limit_bytes)
+        return {
+            "scheme": "cgroup_v2" if cg else "rlimit",
+            "isolation_level": level,
+            "cgroup": {**self.cgroups.report(), "mode": settings.cgroup_mode},
+            "sandbox_cpu_quota": cg and bool(settings.cpu_quota),
+            "sandbox_memory_quota": cg and bool(settings.memory_limit_bytes),
+            "sandbox_pid_quota": cg and bool(settings.pids_limit),
+            "execution_cgroup_supervision": cg,
+            "limits": {
+                "cpu_cores_per_sandbox": settings.cpu_quota if cg else None,
+                "memory_bytes_per_sandbox": settings.memory_limit_bytes if cg else None,
+                "swap_bytes_per_sandbox": 0 if cg and settings.memory_limit_bytes else None,
+                "pids_per_sandbox": settings.pids_limit if cg else None,
+                "address_space_bytes_per_process": (
+                    settings.address_space_limit_bytes if rlimit_as else None
+                ),
+                "wall_clock_seconds_per_exec_default": settings.default_timeout_seconds,
+                "worker_memory_reserve_bytes": (
+                    settings.worker_memory_reserve_bytes if cg else None
+                ),
+            },
         }
 
     async def _probe_candidate(
@@ -561,14 +620,27 @@ class SandboxRuntime:
         self._check_not_destroying(sandbox.sandbox_id)
         self.get(sandbox.sandbox_id, sandbox.generation)
         command = self.builder.build(sandbox, request, template_mounts=template_mounts)
+        leaf: Path | None = None
+        if self.cgroup_active:
+            leaf = await asyncio.to_thread(
+                self.cgroups.create_execution, sandbox.sandbox_id, request.exec_id
+            )
+            command = placement_prefix(leaf) + command
         started = time.monotonic()
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except BaseException:
+            if leaf is not None:
+                await asyncio.to_thread(self.cgroups.remove_execution, leaf)
+            raise
         self.processes[(sandbox.sandbox_id, request.exec_id)] = process
+        if leaf is not None:
+            self._exec_cgroups[(sandbox.sandbox_id, request.exec_id)] = leaf
         timeout = request.timeout_seconds or self.settings.default_timeout_seconds
         status = "SUCCEEDED"
         assert process.stdout is not None and process.stderr is not None
@@ -614,8 +686,28 @@ class SandboxRuntime:
             raise
         finally:
             self.processes.pop((sandbox.sandbox_id, request.exec_id), None)
+            stats: dict[str, int] = {}
+            if leaf is not None:
+                self._exec_cgroups.pop((sandbox.sandbox_id, request.exec_id), None)
+                stats = await asyncio.to_thread(self.cgroups.execution_stats, leaf)
+                # Kills any descendant that outlived the command, then removes
+                # the leaf: nothing a command starts survives its execution.
+                await asyncio.to_thread(self.cgroups.remove_execution, leaf)
+            elif not self._has_processes(sandbox.sandbox_id):
+                # Without a cgroup, a descendant that left the process group
+                # (a fork bomb's survivors, a daemonized server) keeps the
+                # sandbox UID's RLIMIT_NPROC budget. Nothing else of this
+                # sandbox runs, so every process of its UID is such a leftover.
+                await asyncio.to_thread(self._kill_uid, sandbox.uid)
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
+        error_code = None
+        if stats.get("memory.oom_kill") or stats.get("memory.oom_group_kill"):
+            status = "OOM_KILLED"
+            error_code = "SANDBOX_MEMORY_LIMIT_EXCEEDED"
+        elif stats.get("pids.max"):
+            # The command hit pids.max at least once: forks failed with EAGAIN.
+            error_code = "SANDBOX_PIDS_LIMIT_REACHED"
         if status == "SUCCEEDED" and process.returncode != 0:
             status = "FAILED"
         self.touch(sandbox.sandbox_id)
@@ -627,6 +719,7 @@ class SandboxRuntime:
             stderr=stderr,
             duration_ms=int((time.monotonic() - started) * 1000),
             truncated=stdout_cut or stderr_cut,
+            error_code=error_code,
         )
 
     def supports_templates(self) -> bool:
@@ -757,6 +850,9 @@ class SandboxRuntime:
         if process is None:
             return False
         await self._terminate(process)
+        leaf = self._exec_cgroups.get((sandbox_id, exec_id))
+        if leaf is not None:
+            await asyncio.to_thread(self.cgroups.remove_execution, leaf)
         return True
 
     async def destroy(self, sandbox_id: str, *, delete_files: bool = True) -> None:
@@ -775,6 +871,10 @@ class SandboxRuntime:
             for (sid, _), process in list(self.processes.items()):
                 if sid == sandbox_id:
                     await self._terminate(process)
+            await asyncio.to_thread(self.cgroups.remove_sandbox, sandbox_id)
+            sandbox = self.sandboxes.get(sandbox_id)
+            if sandbox is not None and not self.cgroup_active:
+                await asyncio.to_thread(self._kill_uid, sandbox.uid)
             await complete_in_thread(self._destroy_files, sandbox_id, delete_files)
         finally:
             self._destroying.discard(sandbox_id)
@@ -870,6 +970,8 @@ class SandboxRuntime:
                         )
                     self.sandboxes.pop(sandbox_id, None)
                     self.last_active_at.pop(sandbox_id, None)
+                    # A dormant sandbox runs nothing and holds no cgroup.
+                    self.cgroups.remove_sandbox(sandbox_id)
                     self.dormant[sandbox_id] = DormantSandbox(
                         sandbox_id=sandbox_id,
                         generation=generation,
@@ -1069,8 +1171,40 @@ class SandboxRuntime:
                 continue
         return removed
 
+    def _kill_uid(self, uid: int) -> None:
+        """SIGKILL every process of a sandbox UID, as that UID.
+
+        kill(-1) from the UID itself reaches exactly its own processes, which
+        no PID scan can do race-free against a process that keeps forking.
+        """
+        if os.geteuid() != 0 or uid == os.geteuid():
+            return
+        for _ in range(3):
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(
+                    [
+                        str(self.settings.setpriv_path),
+                        "--reuid",
+                        str(uid),
+                        "--regid",
+                        str(uid),
+                        "--clear-groups",
+                        "--",
+                        "/bin/kill",
+                        "-KILL",
+                        "-1",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+
     def _has_processes(self, sandbox_id: str) -> bool:
-        return any(sid == sandbox_id for sid, _ in self.processes)
+        return any(sid == sandbox_id for sid, _ in self.processes) or bool(
+            self.cgroups.sandbox_processes(sandbox_id)
+        )
 
     async def reclaim_dormant_disk(self) -> list[str]:
         """Evict local copies of snapshotted dormant sandboxes under disk pressure.
@@ -1163,6 +1297,9 @@ class SandboxRuntime:
         for process in list(self.processes.values()):
             await self._terminate(process)
         self.processes.clear()
+        for sandbox_id in list(self.sandboxes):
+            await asyncio.to_thread(self.cgroups.remove_sandbox, sandbox_id)
+        self.cgroups.close()
 
     async def write_file(self, sandbox: LocalSandbox, path: str, content_base64: str) -> None:
         content = base64.b64decode(content_base64, validate=True)
@@ -1333,6 +1470,7 @@ def _runtime_profile(
     disable_nested_userns: bool,
     isolation_level: IsolationLevel = IsolationLevel.BASIC,
     additional_features: tuple[str, ...] = (),
+    rlimit_memory: bool = True,
 ) -> SandboxRuntimeProfile:
     return SandboxRuntimeProfile(
         profile_id=settings.profile_id,
@@ -1350,6 +1488,9 @@ def _runtime_profile(
         max_processes=settings.max_processes,
         max_open_files=settings.max_open_files,
         max_file_size_bytes=settings.max_file_size_bytes,
+        max_address_space_bytes=(
+            settings.address_space_limit_bytes or None if rlimit_memory else None
+        ),
         readonly_mounts=tuple(settings.readonly_mounts),
     )
 

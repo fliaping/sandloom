@@ -101,6 +101,21 @@ class Settings(BaseSettings):
     tmpfs_bytes: int = 512 * 1024 * 1024
     cpu_seconds: int = 300
     max_processes: int = 64
+    # Per-sandbox resource limits. With a delegated cgroup v2 subtree these are
+    # aggregate cgroup limits over every command in the sandbox; without one,
+    # memory falls back to a per-process RLIMIT_AS (see docs/ISOLATION.md).
+    # `auto` uses cgroups when the worker can manage them, `required` refuses
+    # to start without them, `off` never uses them. The strict isolation level
+    # always needs them.
+    cgroup_mode: str = "auto"
+    cpu_quota: float = Field(default=2.0, ge=0)
+    memory_limit_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=0)
+    pids_limit: int = Field(default=512, ge=0)
+    worker_memory_reserve_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    # Per-process virtual memory cap used only when cgroups are not active.
+    # Larger than the memory limit because runtimes such as Node and the JVM
+    # reserve address space they never touch. 0 disables it.
+    address_space_limit_bytes: int = Field(default=8 * 1024 * 1024 * 1024, ge=0)
     max_open_files: int = 512
     max_file_size_bytes: int = 1024 * 1024 * 1024
     max_output_bytes: int = 8 * 1024 * 1024
@@ -250,6 +265,14 @@ class Settings(BaseSettings):
         for item in value:
             ipaddress.ip_address(item.strip())
         return [item.strip() for item in value if item.strip()]
+
+    @field_validator("cgroup_mode")
+    @classmethod
+    def validate_cgroup_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"auto", "required", "off"}:
+            raise ValueError("SANDBOX_CGROUP_MODE must be auto, required or off")
+        return normalized
 
     @field_validator("isolation_level")
     @classmethod

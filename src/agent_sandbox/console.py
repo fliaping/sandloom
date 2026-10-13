@@ -337,7 +337,7 @@ const bytes = (value) => {
 const STATUS_TONE = {
   READY: "ok", ACTIVE: "ok", RUNNING: "run", ASSIGNED: "warn",
   RELEASING: "warn", RELEASED: "off", SUSPENDING: "warn", SUSPENDED: "off", SUCCEEDED: "ok",
-  FAILED: "bad", TIMED_OUT: "bad", CANCELLED: "off", LOST: "bad", DRAINING: "warn",
+  FAILED: "bad", TIMED_OUT: "bad", OOM_KILLED: "bad", CANCELLED: "off", LOST: "bad", DRAINING: "warn",
 };
 const status = (value) => el("span", { class: "st " + (STATUS_TONE[value] || "") }, value || "—");
 
@@ -580,7 +580,7 @@ function execs(d) {
       }),
       el("select", {
         onchange: (e) => { S.filters.status = e.target.value; S.page.offset = 0; load(); },
-      }, ["", "RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"].map((v) =>
+      }, ["", "RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "OOM_KILLED", "CANCELLED"].map((v) =>
         el("option", { value: v, selected: S.filters.status === v }, v || "All statuses"))),
     ),
     executionDetail(),
