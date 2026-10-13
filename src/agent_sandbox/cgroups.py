@@ -44,6 +44,25 @@ class CgroupLimits:
     memory_bytes: int | None
     pids: int | None
     worker_memory_reserve_bytes: int = 0
+    io_device: str | None = None  # "major:minor" of the workspace device
+    io_rbps: int = 0
+    io_wbps: int = 0
+    io_riops: int = 0
+    io_wiops: int = 0
+
+    @property
+    def io_line(self) -> str | None:
+        parts = [
+            f"{key}={value}"
+            for key, value in (
+                ("rbps", self.io_rbps),
+                ("wbps", self.io_wbps),
+                ("riops", self.io_riops),
+                ("wiops", self.io_wiops),
+            )
+            if value
+        ]
+        return f"{self.io_device} {' '.join(parts)}" if self.io_device and parts else None
 
 
 def _write(path: Path, value: str) -> None:
@@ -88,7 +107,10 @@ class CgroupManager:
     detail: str = "not initialized"
     _created: set[Path] = field(default_factory=set)
     _helper: subprocess.Popen[bytes] | None = None
+    _controllers: str = "+cpu +memory +pids"
     helper_mount_point: Path = Path("/run/sandloom-cgroup")
+    io_active: bool = False
+    io_detail: str = "not configured"
 
     # ── setup ──
 
@@ -175,10 +197,25 @@ class CgroupManager:
             for pid in pids:
                 with contextlib.suppress(ProcessLookupError, OSError):
                     _write(worker / "cgroup.procs", pid)
-        _write(base / "cgroup.subtree_control", " ".join(f"+{c}" for c in CONTROLLERS))
+        controllers = list(CONTROLLERS)
+        if "io" in available and self.limits.io_line:
+            controllers.append("io")
+        enable = " ".join(f"+{c}" for c in controllers)
+        _write(base / "cgroup.subtree_control", enable)
         sandboxes = base / "sandboxes"
         sandboxes.mkdir(exist_ok=True)
-        _write(sandboxes / "cgroup.subtree_control", " ".join(f"+{c}" for c in CONTROLLERS))
+        _write(sandboxes / "cgroup.subtree_control", enable)
+        self._controllers = enable
+        limits = self.limits
+        if not (limits.io_rbps or limits.io_wbps or limits.io_riops or limits.io_wiops):
+            self.io_detail = "no io limit configured"
+        elif not limits.io_device:
+            self.io_detail = (
+                "workspace device unresolved (overlay, tmpfs or network filesystem); "
+                "set SANDBOX_IO_DEVICE"
+            )
+        elif "io" not in available:
+            self.io_detail = "io controller not delegated"
         reserve = self.limits.worker_memory_reserve_bytes
         if reserve:
             # Protect the control process from reclaim, and keep the sandboxes
@@ -218,7 +255,16 @@ class CgroupManager:
                     _write(path / "memory.swap.max", "0")
             if limits.pids:
                 _write(path / "pids.max", str(limits.pids))
-            _write(path / "cgroup.subtree_control", " ".join(f"+{c}" for c in CONTROLLERS))
+            io_line = self.limits.io_line
+            if io_line and "+io" in self._controllers:
+                try:
+                    _write(path / "io.max", io_line)
+                    self.io_active = True
+                    self.io_detail = f"io.max {io_line}"
+                except OSError as exc:
+                    self.io_active = False
+                    self.io_detail = f"io.max rejected for {self.limits.io_device}: {exc}"
+            _write(path / "cgroup.subtree_control", self._controllers)
         return path
 
     def create_execution(self, sandbox_id: str, exec_id: str) -> Path:
@@ -320,6 +366,48 @@ def _effective_memory_max(path: Path) -> int | None:
         except (OSError, ValueError):
             return None
     return limit
+
+
+def block_device_of(path: Path) -> str | None:
+    """ "major:minor" of the block device holding ``path``, for io.max.
+
+    Overlay and tmpfs have anonymous devices (major 0) that io.max rejects;
+    then the mount source is tried, and a partition maps to its disk.
+    """
+    try:
+        dev = os.stat(path).st_dev
+    except OSError:
+        return None
+    major, minor = os.major(dev), os.minor(dev)
+    if major == 0:
+        source = _mount_source(path)
+        if source is None or not source.startswith("/dev/"):
+            return None
+        try:
+            rdev = os.stat(source).st_rdev
+        except OSError:
+            return None
+        major, minor = os.major(rdev), os.minor(rdev)
+    # io.max applies to whole disks; a partition's parent is in sysfs.
+    sysfs = Path(f"/sys/dev/block/{major}:{minor}")
+    if (sysfs / "partition").exists():
+        with contextlib.suppress(OSError, ValueError):
+            parent = (sysfs.resolve().parent / "dev").read_text().strip()
+            return parent
+    return f"{major}:{minor}"
+
+
+def _mount_source(path: Path) -> str | None:
+    best: tuple[int, str] | None = None
+    target = str(path.resolve())
+    with contextlib.suppress(OSError):
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            left, _, right = line.partition(" - ")
+            mount_point = left.split()[4]
+            if target == mount_point or target.startswith(mount_point.rstrip("/") + "/"):
+                if best is None or len(mount_point) > best[0]:
+                    best = (len(mount_point), right.split()[1])
+    return best[1] if best else None
 
 
 def placement_prefix(leaf: Path) -> list[str]:

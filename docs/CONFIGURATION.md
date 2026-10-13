@@ -75,6 +75,14 @@ profile identity.
 | `SANDBOX_PIDS_LIMIT` | `512` | Processes and threads per sandbox (`pids.max`). `0` leaves it unlimited. cgroup scheme only. |
 | `SANDBOX_WORKER_MEMORY_RESERVE_BYTES` | `268435456` | Memory kept for the worker's control process: set as `memory.min` on its leaf and subtracted from the sandboxes' aggregate `memory.max`. cgroup scheme only. |
 | `SANDBOX_ADDRESS_SPACE_LIMIT_BYTES` | `8589934592` | Fallback per-process `RLIMIT_AS`, applied only when cgroups are not active. Larger than the memory limit because Node and the JVM reserve address space they never use. `0` disables it. |
+| `SANDBOX_SUPERVISOR_INTERVAL_SECONDS` | `0.1` | Without cgroups, how often the supervisor samples `/proc` to enforce `SANDBOX_MEMORY_LIMIT_BYTES` (sum of PSS) and `SANDBOX_CPU_QUOTA` (SIGSTOP/SIGCONT duty cycle) over all processes of the sandbox UID. Shorter is tighter and costs more worker CPU. |
+| `SANDBOX_DISK_LIMIT_BYTES` | `10737418240` | Allocated bytes per sandbox (workspace, home, cache, envs), every scheme. Growth past it kills running executions with `SANDBOX_DISK_QUOTA_EXCEEDED`; File API writes over it are refused (HTTP 507). Deleting is always allowed. `0` disables it. |
+| `SANDBOX_DISK_CHECK_INTERVAL_SECONDS` | `2.0` | How often the disk usage of a sandbox with a running execution is measured. |
+| `SANDBOX_IO_READ_BPS` | `268435456` | `io.max rbps` per sandbox on the device holding `SANDBOX_LOCAL_ROOT` (cgroup scheme). `0` is unlimited. |
+| `SANDBOX_IO_WRITE_BPS` | `268435456` | `io.max wbps`, as above. |
+| `SANDBOX_IO_READ_IOPS` | `0` | `io.max riops`, as above. |
+| `SANDBOX_IO_WRITE_IOPS` | `0` | `io.max wiops`, as above. |
+| `SANDBOX_IO_DEVICE` | `""` | `major:minor` for `io.max` when it cannot be derived from `SANDBOX_LOCAL_ROOT` (overlay, network filesystems). |
 | `SANDBOX_MAX_OPEN_FILES` | `512` | Open descriptors per process (`RLIMIT_NOFILE`), not per sandbox. |
 | `SANDBOX_MAX_FILE_SIZE_BYTES` | `1073741824` (1 GiB) | Largest individual file (`RLIMIT_FSIZE`), not an aggregate disk quota. |
 | `SANDBOX_READONLY_MOUNTS` | `/usr,/bin,/sbin,/lib,/lib64,/etc` | Host trees mounted read-only into every sandbox. |

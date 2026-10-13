@@ -40,11 +40,18 @@ from agent_sandbox_runtime import (
 )
 
 from .archive import ArchiveLimits
-from .cgroups import CgroupLimits, CgroupManager, CgroupUnavailable, placement_prefix
+from .cgroups import (
+    CgroupLimits,
+    CgroupManager,
+    CgroupUnavailable,
+    block_device_of,
+    placement_prefix,
+)
 from .config import Settings
 from .dormant import restore_snapshot, write_snapshot
 from .isolation_policy import negotiate_features
 from .schemas import ExecRequest, ExecResponse
+from .supervisor import DISK, SandboxSupervisor, can_read_foreign_io, disk_usage
 from .templates import (
     TEMPLATE_MOUNT_ROOT,
     LocalTemplateCache,
@@ -268,7 +275,20 @@ class SandboxRuntime:
                 memory_bytes=settings.memory_limit_bytes or None,
                 pids=settings.pids_limit or None,
                 worker_memory_reserve_bytes=settings.worker_memory_reserve_bytes,
+                io_device=settings.io_device or block_device_of(settings.workspace_root),
+                io_rbps=settings.io_read_bps,
+                io_wbps=settings.io_write_bps,
+                io_riops=settings.io_read_iops,
+                io_wiops=settings.io_write_iops,
             )
+        )
+        self.supervisor = SandboxSupervisor(
+            memory_bytes=None,
+            cpu_cores=None,
+            disk_bytes=settings.disk_limit_bytes or None,
+            interval=settings.supervisor_interval_seconds,
+            disk_interval=settings.disk_check_interval_seconds,
+            kill_uid=self._kill_uid,
         )
         self.cgroups.detail = "disabled by SANDBOX_CGROUP_MODE=off"
         self._exec_cgroups: dict[tuple[str, str], Path] = {}
@@ -290,6 +310,18 @@ class SandboxRuntime:
     async def probe(self) -> dict[str, object]:
         await asyncio.to_thread(self._setup_cgroups)
         rlimit_memory = not self.cgroup_active
+        if not self.cgroup_active:
+            # No kernel aggregate: the supervisor enforces the sandbox totals.
+            self.supervisor.memory_bytes = self.settings.memory_limit_bytes or None
+            self.supervisor.cpu_cores = self.settings.cpu_quota or None
+            io_wanted = bool(self.settings.io_read_bps or self.settings.io_write_bps)
+            self._io_accounting = io_wanted and await asyncio.to_thread(
+                can_read_foreign_io, str(self.settings.setpriv_path), self.settings.uid_start
+            )
+            if self._io_accounting:
+                self.supervisor.io_read_bps = self.settings.io_read_bps or None
+                self.supervisor.io_write_bps = self.settings.io_write_bps or None
+        self.supervisor.start()
         runtime_report = await asyncio.to_thread(self.builder.probe)
         probe_root = self.settings.workspace_root / f".probe-{uuid.uuid4().hex}"
         probe_id = probe_root.name
@@ -441,7 +473,6 @@ class SandboxRuntime:
                     "bytes_per_file": self.settings.max_file_size_bytes,
                 },
                 **self._resource_report(selection.selected.label),
-                "sandbox_disk_quota": False,
             },
             "landlock": False,
             "extension": dict(self.extension.capability_labels),
@@ -450,20 +481,74 @@ class SandboxRuntime:
     def _resource_report(self, level: str) -> dict[str, object]:
         cg = self.cgroup_active
         settings = self.settings
+        sup = self.supervisor
         rlimit_as = (not cg) and bool(settings.address_space_limit_bytes)
+        interval_ms = int(settings.supervisor_interval_seconds * 1000)
+        supervised = (
+            f"supervised: /proc sampled every {interval_ms} ms; may overshoot "
+            "for up to one interval and does not charge processes shorter than it"
+        )
+
+        def how(kernel: bool, supervised_on: bool) -> str | None:
+            return "kernel (cgroup v2)" if kernel else supervised if supervised_on else None
+
+        memory = how(cg and bool(settings.memory_limit_bytes), bool(sup.memory_bytes))
+        cpu = how(cg and bool(settings.cpu_quota), bool(sup.cpu_cores))
+        pids = (
+            "kernel (cgroup v2 pids.max)"
+            if cg and settings.pids_limit
+            else "kernel (RLIMIT_NPROC on the sandbox's own UID)"
+            if settings.max_processes
+            else None
+        )
+        disk = (
+            f"supervised: allocated blocks summed every "
+            f"{settings.disk_check_interval_seconds:g} s; growth over the quota kills "
+            "the running executions, File API writes are refused"
+            if sup.disk_bytes
+            else None
+        )
+        io = (
+            f"kernel ({self.cgroups.io_detail})"
+            if cg and self.cgroups.io_active
+            else (
+                "supervised: storage read/write bytes (/proc/<pid>/io) duty-cycled to "
+                "the bps limits; page-cache writes are charged when written back"
+            )
+            if not cg and (sup.io_read_bps or sup.io_write_bps)
+            else (
+                "none: per-process I/O counters of sandbox UIDs are unreadable "
+                "(the worker needs CAP_SYS_PTRACE); lowest I/O priority (ionice) only"
+            )
+            if not cg
+            else f"none: {self.cgroups.io_detail}"
+        )
         return {
-            "scheme": "cgroup_v2" if cg else "rlimit",
+            "scheme": "cgroup_v2" if cg else "rlimit+supervisor",
             "isolation_level": level,
             "cgroup": {**self.cgroups.report(), "mode": settings.cgroup_mode},
-            "sandbox_cpu_quota": cg and bool(settings.cpu_quota),
-            "sandbox_memory_quota": cg and bool(settings.memory_limit_bytes),
-            "sandbox_pid_quota": cg and bool(settings.pids_limit),
+            "supervisor": sup.report() if not cg or sup.disk_bytes else None,
+            "sandbox_cpu_quota": cpu is not None,
+            "sandbox_memory_quota": memory is not None,
+            "sandbox_pid_quota": pids is not None,
+            "sandbox_disk_quota": disk is not None,
+            "sandbox_io_limit": (cg and self.cgroups.io_active)
+            or (not cg and bool(sup.io_read_bps or sup.io_write_bps)),
             "execution_cgroup_supervision": cg,
+            "enforcement": {
+                "cpu": cpu,
+                "memory": memory,
+                "pids": pids,
+                "disk": disk,
+                "io": io,
+            },
             "limits": {
-                "cpu_cores_per_sandbox": settings.cpu_quota if cg else None,
-                "memory_bytes_per_sandbox": settings.memory_limit_bytes if cg else None,
+                "cpu_cores_per_sandbox": settings.cpu_quota or None,
+                "memory_bytes_per_sandbox": settings.memory_limit_bytes or None,
                 "swap_bytes_per_sandbox": 0 if cg and settings.memory_limit_bytes else None,
-                "pids_per_sandbox": settings.pids_limit if cg else None,
+                "pids_per_sandbox": settings.pids_limit if cg else settings.max_processes,
+                "disk_bytes_per_sandbox": settings.disk_limit_bytes or None,
+                "io_max": self.cgroups.limits.io_line if cg else None,
                 "address_space_bytes_per_process": (
                     settings.address_space_limit_bytes if rlimit_as else None
                 ),
@@ -626,6 +711,12 @@ class SandboxRuntime:
                 self.cgroups.create_execution, sandbox.sandbox_id, request.exec_id
             )
             command = placement_prefix(leaf) + command
+        elif shutil.which("ionice"):
+            # Best effort without io.max: the lowest best-effort priority, so a
+            # sandbox's I/O yields to the worker's on schedulers that honour it.
+            command = ["ionice", "-c", "2", "-n", "7", "--", *command]
+        exec_key = request.exec_id
+        self.supervisor.begin(sandbox.sandbox_id, sandbox.uid, sandbox.root, exec_key)
         started = time.monotonic()
         try:
             process = await asyncio.create_subprocess_exec(
@@ -635,6 +726,7 @@ class SandboxRuntime:
                 start_new_session=True,
             )
         except BaseException:
+            self.supervisor.end(sandbox.sandbox_id, exec_key)
             if leaf is not None:
                 await asyncio.to_thread(self.cgroups.remove_execution, leaf)
             raise
@@ -686,6 +778,7 @@ class SandboxRuntime:
             raise
         finally:
             self.processes.pop((sandbox.sandbox_id, request.exec_id), None)
+            verdict = self.supervisor.end(sandbox.sandbox_id, exec_key)
             stats: dict[str, int] = {}
             if leaf is not None:
                 self._exec_cgroups.pop((sandbox.sandbox_id, request.exec_id), None)
@@ -702,7 +795,14 @@ class SandboxRuntime:
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
         error_code = None
-        if stats.get("memory.oom_kill") or stats.get("memory.oom_group_kill"):
+        if verdict == DISK:
+            status = "FAILED"
+            error_code = DISK
+        elif (
+            verdict is not None
+            or stats.get("memory.oom_kill")
+            or stats.get("memory.oom_group_kill")
+        ):
             status = "OOM_KILLED"
             error_code = "SANDBOX_MEMORY_LIMIT_EXCEEDED"
         elif stats.get("pids.max"):
@@ -872,6 +972,7 @@ class SandboxRuntime:
                 if sid == sandbox_id:
                     await self._terminate(process)
             await asyncio.to_thread(self.cgroups.remove_sandbox, sandbox_id)
+            self.supervisor.forget(sandbox_id)
             sandbox = self.sandboxes.get(sandbox_id)
             if sandbox is not None and not self.cgroup_active:
                 await asyncio.to_thread(self._kill_uid, sandbox.uid)
@@ -972,6 +1073,7 @@ class SandboxRuntime:
                     self.last_active_at.pop(sandbox_id, None)
                     # A dormant sandbox runs nothing and holds no cgroup.
                     self.cgroups.remove_sandbox(sandbox_id)
+                    self.supervisor.forget(sandbox_id)
                     self.dormant[sandbox_id] = DormantSandbox(
                         sandbox_id=sandbox_id,
                         generation=generation,
@@ -1300,11 +1402,15 @@ class SandboxRuntime:
         for sandbox_id in list(self.sandboxes):
             await asyncio.to_thread(self.cgroups.remove_sandbox, sandbox_id)
         self.cgroups.close()
+        self.supervisor.stop()
 
     async def write_file(self, sandbox: LocalSandbox, path: str, content_base64: str) -> None:
         content = base64.b64decode(content_base64, validate=True)
         if len(content) > self.settings.max_file_api_bytes:
             raise ValueError("file exceeds the sandbox File API size limit")
+        limit = self.settings.disk_limit_bytes
+        if limit and await asyncio.to_thread(disk_usage, sandbox.root) + len(content) > limit:
+            raise RuntimeError("SANDBOX_DISK_QUOTA_EXCEEDED")
         with self._path_lock(sandbox, path):
             WorkspaceFiles(sandbox.workspace, sandbox.uid).write(path, content)
         self.touch(sandbox.sandbox_id)

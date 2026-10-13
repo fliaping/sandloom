@@ -166,6 +166,7 @@ _STATUS_BY_CODE = {
     "SANDBOX_EXEC_SCOPE_BUSY": 409,
     "SANDBOX_EXEC_SCOPE_LOCKED": 409,
     "SANDBOX_FILE_PATH_LOCKED": 409,
+    "SANDBOX_DISK_QUOTA_EXCEEDED": 507,
     # Suspend and resume. A suspended sandbox refuses work until it is resumed;
     # a suspend refuses while anything runs in it. Both are the caller's move.
     "SANDBOX_NOT_FOUND": 404,

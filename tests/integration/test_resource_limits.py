@@ -33,8 +33,8 @@ pytestmark = [
 MEMORY_LIMIT = 256 * 1024 * 1024
 
 
-@pytest.fixture
-async def runtime(tmp_path: Path) -> Any:
+@pytest.fixture(params=["auto", "off"], ids=["cgroup-if-available", "rlimit-supervisor"])
+async def runtime(tmp_path: Path, request: pytest.FixtureRequest) -> Any:
     local_root = tmp_path / "sandboxes"
     local_root.mkdir()
     for ancestor in (local_root, *local_root.parents):
@@ -44,6 +44,7 @@ async def runtime(tmp_path: Path) -> Any:
     instance = SandboxRuntime(
         Settings(
             internal_token="integration-token",
+            cgroup_mode=request.param,
             local_root=local_root,
             database_url=f"sqlite+aiosqlite:///{tmp_path}/control.db",
             uid_start=20100,
@@ -52,6 +53,8 @@ async def runtime(tmp_path: Path) -> Any:
             memory_limit_bytes=MEMORY_LIMIT,
             pids_limit=64,
             address_space_limit_bytes=2 * MEMORY_LIMIT,
+            disk_limit_bytes=128 * 1024 * 1024,
+            disk_check_interval_seconds=0.5,
             min_free_bytes=0,
             disk_high_watermark_percent=99,
         )
@@ -83,9 +86,14 @@ def _scheme(runtime: SandboxRuntime) -> str:
 async def test_report_matches_the_active_scheme(runtime: SandboxRuntime) -> None:
     control = runtime.probe_report["resource_control"]  # type: ignore[attr-defined]
     cgroup = control["scheme"] == "cgroup_v2"
-    assert control["sandbox_memory_quota"] is cgroup
-    assert control["sandbox_cpu_quota"] is cgroup
-    assert control["sandbox_pid_quota"] is cgroup
+    # Aggregate limits hold under both schemes; only how differs.
+    assert control["sandbox_memory_quota"] is True
+    assert control["sandbox_cpu_quota"] is True
+    assert control["sandbox_pid_quota"] is True
+    assert control["sandbox_disk_quota"] is True
+    expected = "kernel" if cgroup else "supervised"
+    assert control["enforcement"]["memory"].startswith(expected)
+    assert control["enforcement"]["cpu"].startswith(expected)
     if not cgroup:
         assert runtime.probe_report["selected_level"] != "strict"  # type: ignore[attr-defined]
         assert control["limits"]["address_space_bytes_per_process"] == 2 * MEMORY_LIMIT
@@ -98,12 +106,12 @@ async def test_memory_bomb_is_stopped(runtime: SandboxRuntime) -> None:
         sandbox,
         "python3 -c 'b=[]\nwhile True: b.append(bytearray(16*1024*1024))'",
     )
-    if _scheme(runtime) == "cgroup_v2":
-        assert result.status == "OOM_KILLED"
-        assert result.error_code == "SANDBOX_MEMORY_LIMIT_EXCEEDED"
-    else:
-        assert result.status == "FAILED"
+    if result.status != "OOM_KILLED":
+        # Without cgroups RLIMIT_AS may stop the single process first.
+        assert _scheme(runtime) != "cgroup_v2"
         assert "MemoryError" in result.stderr
+    else:
+        assert result.error_code == "SANDBOX_MEMORY_LIMIT_EXCEEDED"
     # The sandbox is usable afterwards.
     assert (await _run(runtime, sandbox, "echo ok")).stdout.strip() == "ok"
 
@@ -119,9 +127,35 @@ async def test_fork_bomb_is_bounded_and_leaves_nothing(runtime: SandboxRuntime) 
     assert (await _run(runtime, sandbox, "echo again")).stdout.strip() == "again"
 
 
+async def test_multi_process_memory_is_limited_in_aggregate(runtime: SandboxRuntime) -> None:
+    sandbox = await runtime.create("sandbox-multimem", 1, 20105)
+    # Four processes of 100 MiB: each under every per-process limit.
+    result = await _run(
+        runtime,
+        sandbox,
+        "python3 - <<'P'\nimport multiprocessing as m, time\n"
+        "def f():\n  b=bytearray(100<<20)\n  b[::4096]=b'1'*len(b[::4096])\n  time.sleep(20)\n"
+        "ps=[m.Process(target=f) for _ in range(4)]\n[p.start() for p in ps]\n"
+        "[p.join() for p in ps]\nP",
+        limit=60,
+    )
+    assert result.status == "OOM_KILLED", (result.status, result.stderr[-300:])
+    assert result.error_code == "SANDBOX_MEMORY_LIMIT_EXCEEDED"
+
+
+async def test_disk_quota_stops_a_runaway_writer(runtime: SandboxRuntime) -> None:
+    sandbox = await runtime.create("sandbox-disk", 1, 20106)
+    result = await _run(
+        runtime,
+        sandbox,
+        "for i in $(seq 1 64); do head -c 16777216 /dev/zero > /workspace/f$i; done; sleep 10",
+        limit=60,
+    )
+    assert result.error_code == "SANDBOX_DISK_QUOTA_EXCEEDED"
+    assert (await _run(runtime, sandbox, "rm -f /workspace/f*; echo ok")).stdout.strip() == "ok"
+
+
 async def test_cpu_quota_caps_a_multicore_spin(runtime: SandboxRuntime) -> None:
-    if _scheme(runtime) != "cgroup_v2":
-        pytest.skip("no CPU quota without cgroups; RLIMIT_CPU is per process")
     sandbox = await runtime.create("sandbox-spin", 1, 20104)
     result = await _run(
         runtime,
@@ -133,5 +167,6 @@ async def test_cpu_quota_caps_a_multicore_spin(runtime: SandboxRuntime) -> None:
         limit=60,
     )
     assert result.status == "SUCCEEDED", result.stderr
-    # Four spinners for 3 s wall under a one-core quota: about 3 s of CPU.
-    assert float(result.stdout.strip().splitlines()[-1]) < 3 * 1.5
+    # Four spinners for 3 s wall under a one-core quota: about 3 s of CPU,
+    # plus up to one CPU-second of burst when supervised.
+    assert float(result.stdout.strip().splitlines()[-1]) < 3 * 1.5 + 1

@@ -494,16 +494,25 @@ async def test_without_cgroups_strict_is_unavailable_and_rlimits_apply(
     runtime, _ = await runtime_and_sandbox(tmp_path)
     _fake_probe(runtime, monkeypatch)
     monkeypatch.setattr(runtime, "_setup_cgroups", lambda: None)
+    monkeypatch.setattr("agent_sandbox.runtime.can_read_foreign_io", lambda *a: True)
     report = await runtime.probe()
     # strict promises aggregate limits, so it is not selected without them.
     assert report["selected_level"] == "standard"
     assert "resource limits" in report["probe_failures"]["strict"]
     control = report["resource_control"]
-    assert control["scheme"] == "rlimit"
-    assert control["sandbox_cpu_quota"] is False
-    assert control["sandbox_memory_quota"] is False
-    assert control["sandbox_pid_quota"] is False
+    assert control["scheme"] == "rlimit+supervisor"
+    # Aggregate limits still hold, enforced by the supervisor, and say so.
+    assert control["sandbox_cpu_quota"] is True
+    assert control["sandbox_memory_quota"] is True
+    assert control["enforcement"]["memory"].startswith("supervised")
+    assert control["enforcement"]["cpu"].startswith("supervised")
+    assert control["enforcement"]["pids"].startswith("kernel (RLIMIT_NPROC")
+    assert control["sandbox_pid_quota"] is True
+    assert control["sandbox_disk_quota"] is True
+    assert control["sandbox_io_limit"] is True
+    assert control["enforcement"]["io"].startswith("supervised")
     assert control["execution_cgroup_supervision"] is False
+    assert runtime.supervisor.memory_bytes == 2 * 1024**3
     assert control["limits"]["address_space_bytes_per_process"] == 8 * 1024**3
     assert control["limits"]["wall_clock_seconds_per_exec_default"] == 300
     assert control["process_limits"]["processes_per_real_uid"] == 64
@@ -529,7 +538,10 @@ async def test_with_cgroups_strict_reports_aggregate_quotas(
     assert control["sandbox_cpu_quota"] is True
     assert control["sandbox_memory_quota"] is True
     assert control["sandbox_pid_quota"] is True
-    assert control["sandbox_disk_quota"] is False
+    assert control["sandbox_disk_quota"] is True
+    assert control["enforcement"]["memory"] == "kernel (cgroup v2)"
+    # The kernel enforces memory and CPU; the supervisor only watches disk.
+    assert runtime.supervisor.memory_bytes is None
     assert control["limits"]["memory_bytes_per_sandbox"] == 2 * 1024**3
     assert control["limits"]["address_space_bytes_per_process"] is None
     # The aggregate cgroup limit replaces RLIMIT_AS, which breaks JIT runtimes.

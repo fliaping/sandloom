@@ -161,35 +161,59 @@ See [Hardening](HARDENING.md) for conditional enhancements.
 
 ## Resource limits by level
 
-The resource scheme follows the isolation level and what the outer runtime
-permits. It is negotiated at startup like the level itself, and `/healthz`
-reports the result under `resource_control`.
+Every sandbox is limited in aggregate, over all of its processes. How a limit
+is enforced depends on the isolation level and on what the outer runtime
+permits. The worker negotiates this at startup, the same way it negotiates the
+level, and `/healthz` reports the result under `resource_control`. `scheme`
+is either `cgroup_v2` or `rlimit+supervisor`. `enforcement` says how each
+dimension is enforced: by the kernel, by the supervisor (with its precision),
+or not at all.
 
-| Level | cgroup v2 manageable (default `SANDBOX_CGROUP_MODE=auto`) | No cgroup v2 (or `SANDBOX_CGROUP_MODE=off`) |
+| Level | cgroup v2 manageable (default `SANDBOX_CGROUP_MODE=auto`) | No cgroup v2: cgroup v1 host, no user namespaces, or `SANDBOX_CGROUP_MODE=off` |
 | --- | --- | --- |
-| `basic` | **cgroup scheme**: per sandbox `cpu.max` (`SANDBOX_CPU_QUOTA`, 2 cores), `memory.max` (`SANDBOX_MEMORY_LIMIT_BYTES`, 2 GiB) with `memory.swap.max=0`, `pids.max` (`SANDBOX_PIDS_LIMIT`, 512); one leaf per execution with `memory.oom.group=1`, killed and removed when the execution ends; worker reserve. Plus every rlimit except `RLIMIT_AS`. | **rlimit scheme**: per process `RLIMIT_AS` (`SANDBOX_ADDRESS_SPACE_LIMIT_BYTES`, 8 GiB), `RLIMIT_CPU` (`SANDBOX_CPU_SECONDS`), per UID `RLIMIT_NPROC` (`SANDBOX_MAX_PROCESSES`), `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, no core dumps; the per-execution wall-clock timeout; leftover processes of the sandbox UID killed after the last execution ends. No aggregate CPU or memory bound. |
-| `standard` | Same cgroup scheme. | Same rlimit scheme. The PID namespace additionally ends every process of an execution with it. |
-| `strict` | Same cgroup scheme, plus the cgroup namespace. | **Not available.** `strict` promises aggregate limits, so `auto` selects `standard` and an explicit `SANDBOX_ISOLATION_LEVEL=strict` refuses to start (`resource limits: …` in `probe_failures`). |
+| `basic` | **cgroup scheme** | **rlimit+supervisor scheme** |
+| `standard` | cgroup scheme | rlimit+supervisor scheme. The PID namespace also ends every process of an execution when the execution ends. |
+| `strict` | cgroup scheme, plus the cgroup namespace | **Not available.** `strict` promises kernel-enforced limits. `auto` selects `standard` instead; an explicit `SANDBOX_ISOLATION_LEVEL=strict` refuses to start (`resource limits: …` in `probe_failures`). |
 
-`SANDBOX_CGROUP_MODE=required` refuses to start at any level without cgroups
-(`SANDBOX_CGROUP_UNAVAILABLE`). Use it, or `strict`, wherever untrusted code
-runs: the rlimit scheme bounds each process, not the sandbox, so N processes
-can still use N × `RLIMIT_AS` and every core.
+Each dimension under each scheme:
 
-What a runaway command gets:
-
-| Event | cgroup scheme | rlimit scheme |
+| Dimension (setting, default) | cgroup scheme | rlimit+supervisor scheme |
 | --- | --- | --- |
-| Memory over the limit | The execution's process tree is OOM-killed together; the response is `status=OOM_KILLED`, `error_code=SANDBOX_MEMORY_LIMIT_EXCEEDED`. Other sandboxes and the worker are unaffected. | The allocating process gets `ENOMEM` (`MemoryError` in Python); `status=FAILED`. |
-| Fork bomb | `pids.max` stops it; `error_code=SANDBOX_PIDS_LIMIT_REACHED` when the limit was hit. | `RLIMIT_NPROC` per sandbox UID stops it; the timeout ends it. |
-| CPU spin on many cores | Throttled to `SANDBOX_CPU_QUOTA` cores in total. | Not bounded beyond `RLIMIT_CPU` per process and the timeout. |
-| Leftover background process | Killed with the execution's cgroup (`cgroup.kill`). | Killed when no other execution of the sandbox runs. |
+| Memory (`SANDBOX_MEMORY_LIMIT_BYTES`, 2 GiB) | Kernel: `memory.max` per sandbox, `memory.swap.max=0`, `memory.oom.group=1` per execution. | Supervisor: the sum of PSS over the sandbox UID's processes is sampled every `SANDBOX_SUPERVISOR_INTERVAL_SECONDS` (0.1 s). Above the limit, every process of the UID is SIGKILLed. A fast allocation can overshoot for up to one interval, so per-process `RLIMIT_AS` (`SANDBOX_ADDRESS_SPACE_LIMIT_BYTES`, 8 GiB) stays as a hard backstop. |
+| CPU (`SANDBOX_CPU_QUOTA`, 2 cores) | Kernel: `cpu.max`. | Supervisor: a token bucket over the UID's CPU time (including reaped children), with up to one CPU-second of burst. When the bucket is empty the processes are SIGSTOPped, then SIGCONTed once it refills. Measured: about 1.2 cores over a 4 s spin at a 1-core quota, because of the burst. |
+| Processes (`SANDBOX_PIDS_LIMIT` 512 / `SANDBOX_MAX_PROCESSES` 64) | Kernel: `pids.max`. | Kernel: `RLIMIT_NPROC`. Every sandbox has its own UID, so this already counts the whole sandbox. |
+| Disk (`SANDBOX_DISK_LIMIT_BYTES`, 10 GiB) | Supervisor, every `SANDBOX_DISK_CHECK_INTERVAL_SECONDS` (2 s): when allocated blocks under the sandbox root are over the quota and still growing, the running executions are killed. File API writes are refused with HTTP 507. Deleting files is always allowed. `RLIMIT_FSIZE` caps any single file and `/tmp` is a sized tmpfs. | Same. |
+| I/O (`SANDBOX_IO_READ_BPS`/`WRITE_BPS`, 256 MiB/s; `…_IOPS`, off) | Kernel: `io.max` on the device holding `SANDBOX_LOCAL_ROOT`, or on `SANDBOX_IO_DEVICE`. Needs a real block device; overlay and tmpfs have none, and `enforcement.io` says so. | Supervisor: storage bytes from `/proc/<pid>/io`, duty-cycled like CPU. Needs `CAP_SYS_PTRACE` on the worker. Without it, only the lowest I/O priority (`ionice`) is applied, and `enforcement.io` says so. |
+| Wall clock (`SANDBOX_DEFAULT_TIMEOUT_SECONDS`, 300) | Per execution. | Per execution. |
 
-Release and suspend kill the sandbox cgroup and remove it; a dormant sandbox
-holds none. The worker moves itself into a `worker` leaf with `memory.min` set
-to `SANDBOX_WORKER_MEMORY_RESERVE_BYTES` (256 MiB), and caps the aggregate of
-all sandboxes at the container's memory limit minus that reserve, so the
-container never reaches its own limit because of a sandbox.
+What a runaway command gets back:
+
+| Event | Response |
+| --- | --- |
+| Memory over the limit | `status=OOM_KILLED`, `error_code=SANDBOX_MEMORY_LIMIT_EXCEEDED`. Under the rlimit+supervisor scheme, a single process can instead hit `RLIMIT_AS` first and get `ENOMEM`. |
+| Process limit reached | Forks fail with `EAGAIN`. Under cgroups the response carries `error_code=SANDBOX_PIDS_LIMIT_REACHED`. |
+| Disk over the quota | `error_code=SANDBOX_DISK_QUOTA_EXCEEDED`. |
+| CPU or I/O over the quota | Throttled, not killed. |
+| Leftover background process | Killed when the execution ends (cgroup) or when the sandbox's last execution ends (UID kill). |
+
+The worker keeps memory for itself: its own leaf has `memory.min` set to
+`SANDBOX_WORKER_MEMORY_RESERVE_BYTES`, and the sandboxes' aggregate
+`memory.max` is the container limit minus that reserve. Release and suspend
+remove the sandbox's cgroup and stop supervising it.
+
+Some limits cannot be made exact without the kernel:
+
+- A supervisor samples; it does not intercept. Overshoot is bounded by
+  allocation rate × interval. Use `SANDBOX_CGROUP_MODE=required` or `strict`
+  where that bound is not acceptable.
+- Disk usage is measured, not reserved. A burst can pass the quota by
+  whatever it writes within one check interval. True `ENOSPC` per sandbox
+  needs project quotas (XFS `prjquota`, ext4 `project`) or a per-sandbox
+  loop filesystem, and both need `CAP_SYS_ADMIN`, which the worker
+  deliberately does not have.
+- Supervised I/O cannot charge a process that starts and exits between two
+  samples, because Linux keeps no cumulative I/O counters for reaped
+  children.
 
 ### Outer runtime requirements for the cgroup scheme
 
@@ -215,6 +239,21 @@ controllers delegated to its own cgroup, and a private cgroup namespace:
 - **Kubernetes**: the same mechanism works where the pod may create user
   namespaces (the seccomp profile allows `unshare`/`mount`); give the pod a
   memory limit. Verify with `/healthz` on the target cluster.
+  Verified on kind (Kubernetes 1.31) with this container spec; `emptyDir` sits
+  on the node's overlay, so `io.max` needs a block-backed volume or
+  `SANDBOX_IO_DEVICE`:
+
+  ```yaml
+  securityContext:
+    runAsUser: 0
+    seccompProfile: {type: Unconfined}
+    appArmorProfile: {type: Unconfined}
+  resources:
+    limits: {memory: 4Gi}
+  ```
+- **Supervised I/O without cgroups** additionally needs `cap_add: [SYS_PTRACE]`
+  on the worker, to read other UIDs' `/proc/<pid>/io`. It also lets the
+  supervisor read PSS instead of RSS.
 
 The sandbox UIDs cannot change their own limits: cgroup files are owned by the
 worker's root, and the helper mount is not visible inside the Bubblewrap mount

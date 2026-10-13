@@ -116,6 +116,22 @@ class Settings(BaseSettings):
     # Larger than the memory limit because runtimes such as Node and the JVM
     # reserve address space they never touch. 0 disables it.
     address_space_limit_bytes: int = Field(default=8 * 1024 * 1024 * 1024, ge=0)
+    # Without cgroups, a supervisor enforces the memory and CPU limits above on
+    # the sum of each sandbox UID's processes, sampling /proc this often.
+    supervisor_interval_seconds: float = Field(default=0.1, gt=0, le=5)
+    # Allocated bytes per sandbox root (workspace, home, cache, envs), every
+    # scheme. Checked every disk_check_interval_seconds; 0 disables it.
+    disk_limit_bytes: int = Field(default=10 * 1024 * 1024 * 1024, ge=0)
+    disk_check_interval_seconds: float = Field(default=2.0, gt=0)
+    # io.max per sandbox on the device holding SANDBOX_LOCAL_ROOT (cgroup
+    # scheme). 0 leaves that dimension unlimited.
+    io_read_bps: int = Field(default=256 * 1024 * 1024, ge=0)
+    io_write_bps: int = Field(default=256 * 1024 * 1024, ge=0)
+    io_read_iops: int = Field(default=0, ge=0)
+    io_write_iops: int = Field(default=0, ge=0)
+    # "major:minor" for io.max when it cannot be derived from SANDBOX_LOCAL_ROOT
+    # (an overlay or network filesystem over a known disk).
+    io_device: str = ""
     max_open_files: int = 512
     max_file_size_bytes: int = 1024 * 1024 * 1024
     max_output_bytes: int = 8 * 1024 * 1024
