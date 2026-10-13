@@ -57,7 +57,8 @@ jobs:
       - name: Test adapters against real servers
         run: |
           uv run pytest tests/integration \
-            --ignore=tests/integration/test_bubblewrap_isolation.py -q
+            --ignore=tests/integration/test_bubblewrap_isolation.py \
+            --ignore=tests/integration/test_resource_limits.py -q
       - name: Dump middleware logs on failure
         if: failure()
         run: docker compose -f compose.integration.yaml logs --tail 100
@@ -99,7 +100,8 @@ jobs:
             agent-sandbox-test:latest \
             uv run --no-sync pytest \
               tests/integration/test_bubblewrap_isolation.py \
-              tests/integration/test_template_isolation.py -v
+              tests/integration/test_template_isolation.py \
+              tests/integration/test_resource_limits.py -v -rs
 
   fleet:
     name: Fleet (two replicas)
