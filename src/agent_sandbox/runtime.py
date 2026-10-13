@@ -220,6 +220,11 @@ def configured_toolchains(settings: Settings) -> tuple[Toolchain, ...]:
         "registry_url": settings.cargo_registry_url or None,
         "maven_repository_url": settings.maven_repository_url or None,
         "java_home": settings.java_home or None,
+        "jvm_max_ram_bytes": (
+            settings.memory_limit_bytes
+            if settings.jvm_max_ram_from_limit and settings.memory_limit_bytes
+            else None
+        ),
         "launcher_dir": settings.rust_launcher_dir or None,
         "platform_python_runtime": PLATFORM_PYTHON_RUNTIME,
         "platform_runtime_packages": PLATFORM_RUNTIME_PACKAGES,

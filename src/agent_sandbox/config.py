@@ -118,6 +118,9 @@ class Settings(BaseSettings):
     address_space_limit_bytes: int = Field(default=8 * 1024 * 1024 * 1024, ge=0)
     # Without cgroups, a supervisor enforces the memory and CPU limits above on
     # the sum of each sandbox UID's processes, sampling /proc this often.
+    # Pass -XX:MaxRAM=<SANDBOX_MEMORY_LIMIT_BYTES> to JVMs through the image's
+    # Java launchers, so default heap sizing follows the sandbox, not the host.
+    jvm_max_ram_from_limit: bool = True
     supervisor_interval_seconds: float = Field(default=0.1, gt=0, le=5)
     # Allocated bytes per sandbox root (workspace, home, cache, envs), every
     # scheme. Checked every disk_check_interval_seconds; 0 disables it.
